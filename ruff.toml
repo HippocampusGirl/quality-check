@@ -1,0 +1,18 @@
+[lint]
+select = [
+  "F",   # pyflakes
+  "E",   # pycodestyle
+  "W",   # pycodestyle
+  "I",   # isort
+  "B",   # bugbears
+  "N",   # pep8-naming
+  "C90", # McCabe complexity
+  "PD",  # pandas-vet
+  "PTH", # flake8-use-pathlib
+]
+
+ignore = [
+  "E402",  # Jupyter notebooks can have imports anywhere
+  "F722",  # Syntax error in forward annotation
+  "PD008", # Use .loc instead of .at. If speed is important, use NumPy.
+]
