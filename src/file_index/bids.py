@@ -8,7 +8,7 @@ from .base import FileIndex
 from .utils import split_ext
 
 
-def parse(path: Path) -> Iterator[tuple[str, str]] | None:
+def parse(path: Path) -> Iterator[tuple[str, str]]:
     """
     Parses a BIDS-formatted filename and returns a dictionary of its tags.
 
@@ -20,11 +20,11 @@ def parse(path: Path) -> Iterator[tuple[str, str]] | None:
             file is not a valid BIDS-formatted file.
     """
     if path.is_dir():
-        return None  # Skip directories
+        return  # Skip directories
 
     stem, extension = split_ext(path)
     if stem.startswith("."):
-        return None  # Skip hidden files
+        return  # Skip hidden files
 
     keys, values = tokenize(stem)
 
@@ -78,7 +78,7 @@ def tokenize(stem: str) -> tuple[MutableSequence[str | None], MutableSequence[st
 
 class BIDSIndex(FileIndex):
     def put(self, root: Path) -> None:
-        for path in tqdm(root.glob("**/*"), desc="Indexing files", unit="files"):
+        for path in tqdm(root.glob("**/*"), desc="indexing files", unit="files"):
             tags_iterator = parse(path)
             if tags_iterator is None:
                 continue  # not a valid path

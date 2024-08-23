@@ -1,5 +1,6 @@
 import io
 import re
+from typing import NamedTuple
 from urllib.request import urlopen
 from xml.dom.minidom import Element
 
@@ -19,3 +20,9 @@ def decode_image(element: Element) -> npt.NDArray[np.uint8]:
 
 
 color_pattern = re.compile(r"stroke:\s*(?P<color>[^;]+)")
+
+
+class Report(NamedTuple):
+    direction: str | None
+    axes_index: int | None
+    image: npt.NDArray[np.uint8]

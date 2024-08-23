@@ -1,10 +1,9 @@
 from pathlib import Path
 from typing import Iterator
 
-import numpy as np
 import scipy
-from numpy import typing as npt
 
+from .base import Report
 from .segmentation import parse_segmentation
 
 colors = [
@@ -22,14 +21,17 @@ colors = [
 ]
 
 
-def parse_norm(image_path: str | Path) -> Iterator[npt.NDArray[np.uint8]]:
-    for array in parse_segmentation(image_path, colors):
-        for i in range(1, array.shape[2]):
-            masks = array[..., (i + 1) : -1]  # excluding brain mask
+def parse_norm(image_path: str | Path) -> Iterator[Report]:
+    for report in parse_segmentation(image_path, colors):
+        image = report.image
+
+        # Fix overlapping masks (bug in HALFpipe)
+        for i in range(1, image.shape[2]):
+            masks = image[..., (i + 1) : -1]  # excluding brain mask
 
             overlap = masks.any(axis=-1)
             overlap = scipy.ndimage.binary_dilation(overlap, iterations=2)
 
-            array[overlap, i] = 0
+            image[overlap, i] = 0
 
-        yield array
+        yield report

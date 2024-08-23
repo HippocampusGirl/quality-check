@@ -8,16 +8,13 @@ from types import TracebackType
 from typing import Iterable, Mapping
 
 from file_index.bids import BIDSIndex
-from zstandard import ZstdCompressor
 
 
 @dataclass
-class Datastore(AbstractContextManager):
+class Datastore(AbstractContextManager[None]):
     database: str
 
     connection: sqlite3.Connection = field(init=False)
-
-    compression_context = ZstdCompressor(level=22)
 
     def __enter__(self) -> None:
         self.connection = self.connect()
@@ -27,7 +24,7 @@ class Datastore(AbstractContextManager):
         exc_type: type[BaseException] | None,
         exc_value: BaseException | None,
         traceback: TracebackType | None,
-    ) -> bool | None:
+    ) -> None:
         self.close()
 
     def vacuum(self) -> None:
@@ -35,24 +32,25 @@ class Datastore(AbstractContextManager):
         check_call(["sqlite3", self.database, "VACUUM"])
 
     def connect(self) -> sqlite3.Connection:
-        connection = sqlite3.connect(self.database)
+        connection = sqlite3.connect(self.database, autocommit=False)
         cursor = connection.cursor()
 
-        cursor.execute(
-            """
-            CREATE TABLE IF NOT EXISTS image (
-                id INTEGER PRIMARY KEY,
-                data BLOB NOT NULL,
-                i INTEGER NOT NULL
-            );
-            """
-        )
         cursor.execute(
             """
             CREATE TABLE IF NOT EXISTS string (
                 id INTEGER PRIMARY KEY,
                 data TEXT NOT NULL
-            );
+            ) STRICT;
+            """
+        )
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS image (
+                id INTEGER PRIMARY KEY,
+                direction TEXT,
+                i INTEGER,
+                data BLOB NOT NULL
+            ) STRICT;
             """
         )
         cursor.execute(
@@ -63,7 +61,7 @@ class Datastore(AbstractContextManager):
                 value_id TEXT NOT NULL,
                 FOREIGN KEY (key_id) REFERENCES string (id),
                 FOREIGN KEY (value_id) REFERENCES string (id)
-            );
+            ) STRICT;
             """
         )
         cursor.execute(
@@ -74,13 +72,13 @@ class Datastore(AbstractContextManager):
                 PRIMARY KEY (image_id, tag_id),
                 FOREIGN KEY (image_id) REFERENCES image (id),
                 FOREIGN KEY (tag_id) REFERENCES tag (id)
-            );
+            ) STRICT;
             """
         )
         connection.commit()
         return connection
 
-    def close(self):
+    def close(self) -> None:
         self.connection.close()
 
     def set_tags_from_index(self, index: BIDSIndex) -> None:
@@ -94,21 +92,22 @@ class Datastore(AbstractContextManager):
 
     def set_tags(self, tags: Iterable[tuple[str, str]]) -> None:
         cursor = self.connection.cursor()
+
+        string_counter = Counter(chain.from_iterable(tags))
+        strings = sorted(
+            string_counter.keys(), key=lambda key: string_counter[key], reverse=True
+        )
+
         cursor.execute(
             """
             SELECT data from string;
         """
         )
         strings_in_datastore = list(chain.from_iterable(cursor.fetchall()))
+        if len(strings_in_datastore) > 0:
+            if strings_in_datastore != strings:
+                raise ValueError("Strings in datastore do not match strings in tags")
 
-        string_counter = Counter(chain.from_iterable(tags))
-        for s in strings_in_datastore:
-            if s in string_counter:
-                del string_counter[s]
-
-        strings = sorted(
-            string_counter.keys(), key=lambda key: string_counter[key], reverse=True
-        )
         cursor.executemany(
             """
             INSERT INTO string(
@@ -130,10 +129,11 @@ class Datastore(AbstractContextManager):
                 LEFT JOIN string value ON tag.value_id = value.id;
         """
         )
-        tags_in_datastore = cursor.fetchall()
-        for t in tags_in_datastore:
-            if t in tags:
-                tags.remove(t)
+        tags_in_datastore = set(cursor.fetchall())
+
+        if len(tags_in_datastore) > 0:
+            if tags_in_datastore != set(tags):
+                raise ValueError("Tags in datastore do not match tags in tags")
 
         cursor.executemany(
             """
@@ -149,17 +149,60 @@ class Datastore(AbstractContextManager):
         )
         self.connection.commit()
 
-    def add_image(self, data: bytes, i: int, tags: Mapping[str, str]) -> int:
+    def get_image_ids(self, tags: Mapping[str, str]) -> list[str]:
+        cursor = self.connection.cursor()
+
+        join = " ".join(
+            f"""
+            LEFT JOIN tag AS {key}_tag ON {key}_tag.id = tag_id
+            LEFT JOIN string AS {key}_key ON {key}_tag.key_id = {key}_key.id
+            LEFT JOIN string AS {key}_value ON {key}_tag.value_id = {key}_value.id
+            """
+            for key in tags
+        )
+        where = " AND ".join(
+            f"""
+            {key}_key.data = ?
+            AND
+            {key}_value.data = ?
+            """
+            for key in tags
+        )
+
+        cursor.execute(
+            f"""
+            SELECT
+                image_id
+            FROM
+                image_tag
+                {join}
+            WHERE
+                {where}
+            """,
+            tuple(chain.from_iterable(tags.items())),
+        )
+        return list(chain.from_iterable(cursor.fetchall()))
+
+    def has_image(self, tags: Mapping[str, str]) -> bool:
+        return bool(self.get_image_ids(tags))
+
+    def add_image(
+        self,
+        data: bytes,
+        direction: str | None,
+        i: int | None,
+        tags: Mapping[str, str],
+    ) -> None:
         cursor = self.connection.cursor()
         cursor.execute(
             """
             INSERT INTO image(
-                data, i
+                direction, i, data
             ) VALUES (
-                ?, ?
+                ?, ?, ?
             );
             """,
-            (self.compression_context.compress(data), i),
+            (direction, i, data),
         )
         image_id = cursor.lastrowid
         if image_id is None:
@@ -186,4 +229,3 @@ class Datastore(AbstractContextManager):
             """,
             ((image_id, key, value) for key, value in tags.items()),
         )
-        self.connection.commit()

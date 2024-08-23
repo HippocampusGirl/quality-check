@@ -1,13 +1,13 @@
 import re
 from pathlib import Path
 from typing import Iterator
-from xml.dom.minidom import Comment, Element, parse
+from xml.dom.minidom import Comment, Document, Element, parse
 
 import numpy as np
 import scipy
 from numpy import typing as npt
 
-from .base import color_pattern, decode_image
+from .base import Report, color_pattern, decode_image
 
 annotation_pattern = re.compile(
     r"max: (?P<max>[0-9\.]+) \$\\bullet\$ "
@@ -32,13 +32,13 @@ def find_comments(element: Element) -> Iterator[str]:
 def parse_path(element: Element) -> npt.NDArray[np.float64]:
     d = element.getAttribute("d")
     tokens = d.split()
-    points = []
+    points_list: list[npt.NDArray[np.float64]] = []
 
-    def add_point():
-        point = np.asarray([tokens.pop(0), tokens.pop(0)], dtype=float)
-        if points and np.allclose(points[-1], point):
+    def add_point() -> None:
+        point = np.asarray([tokens.pop(0), tokens.pop(0)], dtype=np.float64)
+        if len(points_list) > 0 and np.allclose(points_list[-1], point):
             return
-        points.append(point)
+        points_list.append(point)
 
     while tokens:
         command = tokens.pop(0)
@@ -47,7 +47,7 @@ def parse_path(element: Element) -> npt.NDArray[np.float64]:
         else:
             raise ValueError(f'Unknown command "{command}"')
 
-    points = np.vstack(points)
+    points = np.vstack(points_list)
     points[:, 1] = points[:, 1].max() - points[:, 1]  # flip y-axis
     points -= points.min(axis=0)
 
@@ -58,12 +58,15 @@ def scale_points(
     points: npt.NDArray[np.float64], mean: float, sigma: float, max: float
 ) -> npt.NDArray[np.float64]:
     y = points[:, 1]
-    y *= sigma / y.std()
+    standard_deviation = y.std()
+    if np.isclose(standard_deviation, 0):
+        standard_deviation = 1  # Avoid division by zero
+    y *= sigma / standard_deviation
     y += mean - y.mean()
     return points
 
 
-def parse_bold_conf(image_path: str | Path) -> Iterator[npt.NDArray[np.uint8]]:
+def parse_bold_conf(image_path: str | Path) -> Iterator[Report]:
     document = parse(str(image_path))
     background_image, confound_estimates = extract_bold_conf_data(document)
     shape = background_image.shape
@@ -71,25 +74,30 @@ def parse_bold_conf(image_path: str | Path) -> Iterator[npt.NDArray[np.uint8]]:
     channels = [background_image]
     for key in confound_estimate_keys:
         points = confound_estimates[key]
-        x, y = points.transpose()
+        point_count, _ = points.shape
+        if point_count > 1:
+            x, y = points.transpose()
+            scale = (y.min(), y.max())
+            if key == "FD":
+                scale = (0, 5)
+            y = np.interp(y, scale, (0, 255))
 
-        scale = (y.min(), y.max())
-        if key == "FD":
-            scale = (0, 5)
-        y = np.interp(y, scale, (0, 255))
-
-        f = scipy.interpolate.interp1d(x, y, kind="cubic")
-        interpolated_y = f(np.linspace(x.min(), x.max(), shape[1]))
-        overlay = np.broadcast_to(interpolated_y[np.newaxis, :], shape).astype(np.uint8)
+            f = scipy.interpolate.interp1d(x, y, kind="cubic")
+            interpolated_y = f(np.linspace(x.min(), x.max(), shape[1]))
+            overlay = np.broadcast_to(interpolated_y[np.newaxis, :], shape).astype(
+                np.uint8
+            )
+        else:
+            overlay = np.zeros(shape, dtype=np.uint8)
 
         channels.append(overlay)
 
-    yield np.stack(channels, axis=2, dtype=np.uint8)
+    yield Report(None, None, np.stack(channels, axis=2, dtype=np.uint8))
 
 
 def extract_bold_conf_data(
-    document: Element
-) -> tuple[dict[str, npt.NDArray[np.float64]], npt.NDArray[np.uint8]]:
+    document: Document,
+) -> tuple[npt.NDArray[np.uint8], dict[str, npt.NDArray[np.float64]]]:
     groups = document.getElementsByTagName("g")
 
     background_image: npt.NDArray[np.uint8] | None = None
@@ -114,11 +122,11 @@ def extract_bold_conf_data(
     return background_image, confound_estimates
 
 
-def extract_points(group) -> tuple[str, npt.NDArray[np.float64]] | None:
+def extract_points(group: Element) -> tuple[str, npt.NDArray[np.float64]] | None:
     comments = set(find_comments(group))
     intersection = set(confound_estimate_keys) & comments
     if not intersection:
-        return
+        return None
     (key,) = intersection
 
     match = None

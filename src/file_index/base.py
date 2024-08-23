@@ -72,7 +72,7 @@ class FileIndex:
         else:
             return matches
 
-    def get_tags(self, path: Path) -> Mapping[str, str | None]:
+    def get_tags(self, path: Path) -> Mapping[str, str]:
         if path in self.tags_by_paths:
             return self.tags_by_paths[path]
         else:

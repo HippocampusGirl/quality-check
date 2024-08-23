@@ -157,3 +157,7 @@ cython_debug/
 
 # Direnv
 .direnv
+
+# pixi environments
+.pixi
+*.egg-info
