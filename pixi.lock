@@ -1560,7 +1560,7 @@ packages:
   license: Apache-2.0
   license_family: APACHE
   purls:
-  - pkg:pypi/etils
+  - pkg:pypi/etils?source=hash-mapping
   size: 781664
   timestamp: 1718200944867
 - kind: conda
@@ -3841,9 +3841,9 @@ packages:
   timestamp: 1674727076728
 - kind: pypi
   name: machine-learning
-  version: 0.0.post1.dev2+g41d5b74.d20240822
+  version: 0.0.post1.dev3+g916c71f.d20240823
   path: .
-  sha256: 2bf6a56ae844b79f57d025774c6bad842f50afcc3940a1bfc60d91b11488579f
+  sha256: b393538656fd7a4d5eee89271e4eaabecafa7710fc0d2c352431c01070c37d4e
   requires_python: '>=3.12'
   editable: true
 - kind: conda

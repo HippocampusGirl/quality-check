@@ -13,7 +13,6 @@ from typing import (
     ContextManager,
     Iterable,
     Iterator,
-    Literal,
     Mapping,
     NamedTuple,
     TypeVar,
@@ -112,25 +111,22 @@ def parse_arguments(argv: list[str]) -> Namespace:
     return argument_parser.parse_args(argv)
 
 
-def run(argv: list[str], error_action: Literal["raise", "ignore"] = "ignore") -> None:
+def run(argv: list[str]) -> None:
     arguments = parse_arguments(argv)
 
     try:
         ingest(arguments)
     except Exception as e:
-        traceback.print_exc()
-        # logger.exception("Exception: %s", e, exc_info=True)
         if arguments.debug:
             import pdb
 
             pdb.post_mortem()
-        if error_action == "raise":
+        else:
             raise e
 
 
 def ingest(arguments: Namespace) -> None:
     database_path = Path(arguments.database)
-    database_path.unlink(missing_ok=True)
 
     dataset_path = Path(arguments.dataset)
     index = BIDSIndex()
