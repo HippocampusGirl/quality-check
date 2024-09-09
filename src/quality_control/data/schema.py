@@ -33,49 +33,48 @@ class Datastore(AbstractContextManager[None]):
 
     def connect(self) -> sqlite3.Connection:
         connection = sqlite3.connect(self.database, autocommit=False)
-        cursor = connection.cursor()
-
-        cursor.execute(
-            """
-            CREATE TABLE IF NOT EXISTS string (
-                id INTEGER PRIMARY KEY,
-                data TEXT NOT NULL
-            ) STRICT;
-            """
-        )
-        cursor.execute(
-            """
-            CREATE TABLE IF NOT EXISTS image (
-                id INTEGER PRIMARY KEY,
-                direction TEXT,
-                i INTEGER,
-                data BLOB NOT NULL
-            ) STRICT;
-            """
-        )
-        cursor.execute(
-            """
-            CREATE TABLE IF NOT EXISTS tag (
-                id INTEGER PRIMARY KEY,
-                key_id TEXT NOT NULL,
-                value_id TEXT NOT NULL,
-                FOREIGN KEY (key_id) REFERENCES string (id),
-                FOREIGN KEY (value_id) REFERENCES string (id)
-            ) STRICT;
-            """
-        )
-        cursor.execute(
-            """
-            CREATE TABLE IF NOT EXISTS image_tag (
-                image_id INTEGER NOT NULL,
-                tag_id INTEGER NOT NULL,
-                PRIMARY KEY (image_id, tag_id),
-                FOREIGN KEY (image_id) REFERENCES image (id),
-                FOREIGN KEY (tag_id) REFERENCES tag (id)
-            ) STRICT;
-            """
-        )
-        connection.commit()
+        with connection:
+            cursor = connection.cursor()
+            cursor.execute(
+                """
+                CREATE TABLE IF NOT EXISTS string (
+                    id INTEGER PRIMARY KEY,
+                    data TEXT NOT NULL UNIQUE
+                ) STRICT;
+                """
+            )
+            cursor.execute(
+                """
+                CREATE TABLE IF NOT EXISTS image (
+                    id INTEGER PRIMARY KEY,
+                    direction TEXT,
+                    i INTEGER,
+                    data BLOB NOT NULL
+                ) STRICT;
+                """
+            )
+            cursor.execute(
+                """
+                CREATE TABLE IF NOT EXISTS tag (
+                    id INTEGER PRIMARY KEY,
+                    key_id TEXT NOT NULL,
+                    value_id TEXT NOT NULL,
+                    FOREIGN KEY (key_id) REFERENCES string (id),
+                    FOREIGN KEY (value_id) REFERENCES string (id)
+                ) STRICT;
+                """
+            )
+            cursor.execute(
+                """
+                CREATE TABLE IF NOT EXISTS image_tag (
+                    image_id INTEGER NOT NULL,
+                    tag_id INTEGER NOT NULL,
+                    PRIMARY KEY (image_id, tag_id),
+                    FOREIGN KEY (image_id) REFERENCES image (id),
+                    FOREIGN KEY (tag_id) REFERENCES tag (id)
+                ) STRICT;
+                """
+            )
         return connection
 
     def close(self) -> None:
@@ -91,63 +90,61 @@ class Datastore(AbstractContextManager[None]):
         self.set_tags(tags)
 
     def set_tags(self, tags: Iterable[tuple[str, str]]) -> None:
-        cursor = self.connection.cursor()
+        connection = self.connection
+        with connection:
+            cursor = connection.cursor()
 
-        string_counter = Counter(chain.from_iterable(tags))
-        strings = sorted(
-            string_counter.keys(), key=lambda key: string_counter[key], reverse=True
-        )
+            string_counter = Counter(chain.from_iterable(tags))
+            strings = sorted(
+                string_counter.keys(), key=lambda key: string_counter[key], reverse=True
+            )
 
-        cursor.execute(
+            cursor.execute("SELECT data FROM string;")
+            strings_in_datastore = list(chain.from_iterable(cursor.fetchall()))
+            if len(strings_in_datastore) > 0:
+                if strings_in_datastore != strings:
+                    raise ValueError(
+                        "Strings in datastore do not match strings in tags"
+                    )
+            else:
+                cursor.executemany(
+                    """
+                    INSERT INTO string(
+                        data
+                    ) VALUES (
+                        ?
+                    );
+                    """,
+                    ((s,) for s in strings),
+                )
+
+            cursor.execute(
+                """
+                SELECT
+                    key.data,
+                    value.data
+                FROM tag
+                    LEFT JOIN string key ON tag.key_id = key.id
+                    LEFT JOIN string value ON tag.value_id = value.id;
             """
-            SELECT data from string;
-        """
-        )
-        strings_in_datastore = list(chain.from_iterable(cursor.fetchall()))
-        if len(strings_in_datastore) > 0:
-            if strings_in_datastore != strings:
-                raise ValueError("Strings in datastore do not match strings in tags")
-
-        cursor.executemany(
-            """
-            INSERT INTO string(
-                data
-            ) VALUES (
-                ?
-            );
-            """,
-            ((s,) for s in strings),
-        )
-
-        cursor.execute(
-            """
-            SELECT
-                key.data,
-                value.data
-            FROM tag
-                LEFT JOIN string key ON tag.key_id = key.id
-                LEFT JOIN string value ON tag.value_id = value.id;
-        """
-        )
-        tags_in_datastore = set(cursor.fetchall())
-
-        if len(tags_in_datastore) > 0:
-            if tags_in_datastore != set(tags):
-                raise ValueError("Tags in datastore do not match tags in tags")
-
-        cursor.executemany(
-            """
-            INSERT INTO tag(
-                key_id,
-                value_id
-            ) VALUES (
-                (SELECT id FROM string WHERE data = ?),
-                (SELECT id FROM string WHERE data = ?)
-            );
-            """,
-            tags,
-        )
-        self.connection.commit()
+            )
+            tags_in_datastore = set(cursor.fetchall())
+            if len(tags_in_datastore) > 0:
+                if tags_in_datastore != set(tags):
+                    raise ValueError("Tags in datastore do not match tags in tags")
+            else:
+                cursor.executemany(
+                    """
+                    INSERT INTO tag(
+                        key_id,
+                        value_id
+                    ) VALUES (
+                        (SELECT id FROM string WHERE data = ?),
+                        (SELECT id FROM string WHERE data = ?)
+                    );
+                    """,
+                    tags,
+                )
 
     def get_image_ids(self, tags: Mapping[str, str]) -> list[str]:
         cursor = self.connection.cursor()

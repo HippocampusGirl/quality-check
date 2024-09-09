@@ -29,7 +29,7 @@ def find_comments(element: Element) -> Iterator[str]:
                 yield node.data.strip()
 
 
-def parse_path(element: Element) -> npt.NDArray[np.float64]:
+def parse_path(element: Element) -> npt.NDArray[np.float64] | None:
     d = element.getAttribute("d")
     tokens = d.split()
     points_list: list[npt.NDArray[np.float64]] = []
@@ -47,10 +47,12 @@ def parse_path(element: Element) -> npt.NDArray[np.float64]:
         else:
             raise ValueError(f'Unknown command "{command}"')
 
+    if len(points_list) == 0:
+        return None
+
     points = np.vstack(points_list)
     points[:, 1] = points[:, 1].max() - points[:, 1]  # flip y-axis
     points -= points.min(axis=0)
-
     return points
 
 
@@ -74,22 +76,21 @@ def parse_bold_conf(image_path: str | Path) -> Iterator[Report]:
     channels = [background_image]
     for key in confound_estimate_keys:
         points = confound_estimates[key]
-        point_count, _ = points.shape
-        if point_count > 1:
-            x, y = points.transpose()
-            scale = (y.min(), y.max())
-            if key == "FD":
-                scale = (0, 5)
-            y = np.interp(y, scale, (0, 255))
 
-            f = scipy.interpolate.interp1d(x, y, kind="cubic")
-            interpolated_y = f(np.linspace(x.min(), x.max(), shape[1]))
-            overlay = np.broadcast_to(interpolated_y[np.newaxis, :], shape).astype(
-                np.uint8
-            )
-        else:
+        if points is None or points.shape[0] <= 1:
             overlay = np.zeros(shape, dtype=np.uint8)
+            channels.append(overlay)
+            continue
 
+        x, y = points.transpose()
+        scale = (y.min(), y.max())
+        if key == "FD":
+            scale = (0, 5)
+        y = np.interp(y, scale, (0, 255))
+
+        f = scipy.interpolate.interp1d(x, y, kind="cubic")
+        interpolated_y = f(np.linspace(x.min(), x.max(), shape[1]))
+        overlay = np.broadcast_to(interpolated_y[np.newaxis, :], shape).astype(np.uint8)
         channels.append(overlay)
 
     yield Report(None, None, np.stack(channels, axis=2, dtype=np.uint8))
@@ -97,11 +98,11 @@ def parse_bold_conf(image_path: str | Path) -> Iterator[Report]:
 
 def extract_bold_conf_data(
     document: Document,
-) -> tuple[npt.NDArray[np.uint8], dict[str, npt.NDArray[np.float64]]]:
+) -> tuple[npt.NDArray[np.uint8], dict[str, npt.NDArray[np.float64] | None]]:
     groups = document.getElementsByTagName("g")
 
     background_image: npt.NDArray[np.uint8] | None = None
-    confound_estimates: dict[str, npt.NDArray[np.float64]] = {}
+    confound_estimates: dict[str, npt.NDArray[np.float64] | None] = {}
     for group in groups:
         group_id = group.getAttribute("id")
         if "axes" not in group_id:
@@ -122,7 +123,7 @@ def extract_bold_conf_data(
     return background_image, confound_estimates
 
 
-def extract_points(group: Element) -> tuple[str, npt.NDArray[np.float64]] | None:
+def extract_points(group: Element) -> tuple[str, npt.NDArray[np.float64] | None] | None:
     comments = set(find_comments(group))
     intersection = set(confound_estimate_keys) & comments
     if not intersection:
@@ -149,7 +150,6 @@ def extract_points(group: Element) -> tuple[str, npt.NDArray[np.float64]] | None
         if color == "#d3d3d3":
             continue
         points = parse_path(element)
-    if points is None:
-        raise ValueError("Could not find path")
-    points = scale_points(points, mean, sigma, max)
+    if points is not None:
+        points = scale_points(points, mean, sigma, max)
     return key, points

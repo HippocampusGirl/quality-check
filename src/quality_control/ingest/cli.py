@@ -24,11 +24,11 @@ from file_index.bids import BIDSIndex
 
 from ..data.compression import compress_image
 from ..data.schema import Datastore
-from ..reports.base import Report
-from ..reports.bold_conf import parse_bold_conf
-from ..reports.norm import parse_norm
-from ..reports.skull_strip import parse_skull_strip
-from ..reports.tsnr import parse_tsnr
+from .base import Report
+from .bold_conf import parse_bold_conf
+from .norm import parse_norm
+from .skull_strip import parse_skull_strip
+from .tsnr import parse_tsnr
 
 multiprocessing_context = get_context("forkserver")
 
@@ -139,15 +139,12 @@ def ingest(arguments: Namespace) -> None:
     suffix = arguments.suffix
     parse = image_parsers[suffix]
 
-    total = len(index.get(suffix=suffix))
-
-    jobs = (
-        Job(parse, path, index.get_tags(path))
-        for path in list(index.get(suffix=suffix))
-    )
+    paths = index.get(suffix=suffix)
+    jobs = [Job(parse, path, index.get_tags(path)) for path in paths]
+    total = len(jobs)
 
     processes = cpu_count()
-    chunksize, extra = divmod(total, processes * 4)
+    chunksize, extra = divmod(total, processes * 2**5)
     if extra:
         chunksize += 1
     pool, iterator = make_pool_or_null_context(
@@ -159,8 +156,6 @@ def ingest(arguments: Namespace) -> None:
         for compressed_reports in tqdm(
             iterator, total=total, unit="images", desc="parsing images"
         ):
-            for compressed_report in compressed_reports:
-                datastore.add_image(*compressed_report)
-            datastore.connection.commit()
-
-    datastore.vacuum()
+            with datastore.connection:
+                for compressed_report in compressed_reports:
+                    datastore.add_image(*compressed_report)
