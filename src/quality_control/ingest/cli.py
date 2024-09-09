@@ -64,6 +64,13 @@ image_parsers: dict[str, ImageParser] = dict(
     bold_conf=parse_bold_conf,
     epi_norm_rpt=parse_norm,
 )
+images_per_file = dict(
+    bold_conf=1,
+    tsnr_rpt=21,
+    t1_norm_rpt=21,
+    skull_strip_report=21,
+    epi_norm_rpt=21,
+)
 
 
 class Job(NamedTuple):
@@ -88,12 +95,15 @@ def parse_image(job: Job, debug: bool = False) -> Iterable[CompressedReport]:
             direction, i, image = report
             image_bytes = compress_image(image)
             compressed_reports.append(CompressedReport(image_bytes, direction, i, tags))
-    except ValueError:
-        print(f"Error parsing {path}: {traceback.format_exc()}", flush=True)
+    except Exception:
+        print(f'Error parsing "{path}": {traceback.format_exc()}', flush=True)
         if debug and parent_process() is None:
             pdb.post_mortem()
-
-    return compressed_reports
+        return list()
+    else:
+        if len(compressed_reports) == 0:
+            print(f'Did not parse any images from "{path}"')
+        return compressed_reports
 
 
 def main() -> None:
@@ -105,7 +115,7 @@ def parse_arguments(argv: list[str]) -> Namespace:
 
     argument_parser.add_argument("--database", required=True)
     argument_parser.add_argument("--dataset", required=True)
-    argument_parser.add_argument("--suffix", required=True)
+    argument_parser.add_argument("--suffix", required=False)
 
     argument_parser.add_argument("--debug", action="store_true", default=False)
     return argument_parser.parse_args(argv)
@@ -125,6 +135,40 @@ def run(argv: list[str]) -> None:
             raise e
 
 
+def generate_jobs(
+    index: BIDSIndex, datastore: Datastore, query: dict[str, str]
+) -> Iterator[Job]:
+    with datastore:
+        if datastore.connection is None:
+            raise RuntimeError
+
+        image_ids_by_tags = datastore.get_image_ids_by_tags()
+
+        to_delete: set[int] = set()
+        for tags_set, image_ids in image_ids_by_tags.items():
+            tags = dict(tags_set)
+            suffix = tags.get("suffix")
+            if suffix is not None:
+                if len(image_ids) == images_per_file[suffix]:
+                    continue
+            to_delete.update(image_ids)
+
+        with datastore.connection:
+            for image_id in tqdm(
+                to_delete, leave=False, desc="deleting incomplete images"
+            ):
+                datastore.remove_image(image_id)
+
+    paths = index.get(**query)
+    for path in paths:
+        suffix = index.get_tag_value(path, "suffix")
+        if suffix is None:
+            continue
+        if frozenset(index.get_tags(path).items()) in image_ids_by_tags:
+            continue
+        yield Job(image_parsers[suffix], path, index.get_tags(path))
+
+
 def ingest(arguments: Namespace) -> None:
     database_path = Path(arguments.database)
 
@@ -136,15 +180,17 @@ def ingest(arguments: Namespace) -> None:
 
     datastore = Datastore(database=str(database_path))
 
-    suffix = arguments.suffix
-    parse = image_parsers[suffix]
+    query = dict(extension=".svg")
+    if arguments.suffix:
+        query["suffix"] = arguments.suffix
 
-    paths = index.get(suffix=suffix)
-    jobs = [Job(parse, path, index.get_tags(path)) for path in paths]
+    jobs = list(tqdm(generate_jobs(index, datastore, query), leave=False))
+    if not jobs:
+        return
     total = len(jobs)
 
     processes = cpu_count()
-    chunksize, extra = divmod(total, processes * 2**5)
+    chunksize, extra = divmod(total, processes * 2**9)
     if extra:
         chunksize += 1
     pool, iterator = make_pool_or_null_context(
@@ -156,6 +202,8 @@ def ingest(arguments: Namespace) -> None:
         for compressed_reports in tqdm(
             iterator, total=total, unit="images", desc="parsing images"
         ):
+            if datastore.connection is None:
+                raise RuntimeError
             with datastore.connection:
                 for compressed_report in compressed_reports:
                     datastore.add_image(*compressed_report)
