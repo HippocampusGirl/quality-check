@@ -46,7 +46,7 @@ zstandard = "*"
 sqlite = ">=3.46.0"
 
 [tool.pixi.feature.gpu]
-platforms = ["linux-64", "osx-64"]
+platforms = ["linux-64"]
 system-requirements = { cuda = "12" }
 
 [tool.pixi.feature.gpu.dependencies]
@@ -59,4 +59,4 @@ mypy = "*"
 ruff = "*"
 
 [tool.pixi.environments]
-default = { features = ["gpu", "notebooks"], solve-group = "default" }
+default = { features = ["notebooks"], solve-group = "default" }
