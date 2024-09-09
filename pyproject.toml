@@ -51,7 +51,6 @@ system-requirements = { cuda = "12" }
 
 [tool.pixi.feature.gpu.dependencies]
 cuda-version = "12.*"
-jaxlib = { version = "*", build = "*cuda*" }
 pytorch = { version = "*", build = "*cuda*" }
 
 [tool.pixi.feature.notebooks.dependencies]
