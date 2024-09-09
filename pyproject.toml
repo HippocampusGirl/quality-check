@@ -16,7 +16,7 @@ version_scheme = "no-guess-dev"
 
 [tool.pixi.project]
 channels = ["conda-forge"]
-platforms = ["linux-64"]
+platforms = ["linux-64", "osx-64"]
 
 [tool.pixi.pypi-dependencies]
 machine-learning = { path = ".", editable = true }
@@ -46,7 +46,7 @@ zstandard = "*"
 sqlite = ">=3.46.0"
 
 [tool.pixi.feature.gpu]
-platforms = ["linux-64"]
+platforms = ["linux-64", "osx-64"]
 system-requirements = { cuda = "12" }
 
 [tool.pixi.feature.gpu.dependencies]
