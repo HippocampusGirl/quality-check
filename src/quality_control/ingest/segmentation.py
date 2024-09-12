@@ -1,6 +1,6 @@
 import io
+import pickle
 from collections import defaultdict
-from copy import deepcopy
 from functools import reduce
 from pathlib import Path
 from typing import Any, Iterable, Iterator, Mapping, NamedTuple, Union
@@ -14,6 +14,11 @@ from PIL import Image
 from .base import Report, color_pattern, decode_image
 
 ascii_codes: Mapping[int, str] = {120: "x", 121: "y", 122: "z"}
+
+
+def deepcopy(obj: Any) -> Any:
+    s = pickle.dumps(obj, protocol=pickle.HIGHEST_PROTOCOL)
+    return pickle.loads(s)
 
 
 class Slice(NamedTuple):

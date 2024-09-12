@@ -4,6 +4,7 @@ import traceback
 from argparse import ArgumentParser, Namespace
 from contextlib import nullcontext
 from functools import cache, partial
+from itertools import chain
 from multiprocessing import get_context, parent_process
 from pathlib import Path
 from subprocess import check_output
@@ -144,22 +145,32 @@ def generate_jobs(
 
         image_ids_by_tags = datastore.get_image_ids_by_tags()
 
-        to_delete: set[int] = set()
+        tags_sets_to_delete: set[frozenset[tuple[str, str]]] = set()
+        image_ids_to_delete: set[int] = set()
         for tags_set, image_ids in image_ids_by_tags.items():
             tags = dict(tags_set)
             suffix = tags.get("suffix")
             if suffix is not None:
                 if len(image_ids) == images_per_file[suffix]:
                     continue
-            to_delete.update(image_ids)
+            tags_sets_to_delete.add(tags_set)
+            image_ids_to_delete.update(image_ids)
+
+        for tags_set in tags_sets_to_delete:
+            del image_ids_by_tags[tags_set]
 
         with datastore.connection:
             for image_id in tqdm(
-                to_delete, leave=False, desc="deleting incomplete images"
+                image_ids_to_delete, leave=False, desc="deleting incomplete images"
             ):
                 datastore.remove_image(image_id)
 
-    paths = index.get(**query)
+    # paths = index.get(**query)
+    paths = list(
+        chain.from_iterable(
+            list(index.get(suffix=suffix))[:100] for suffix in image_parsers
+        )
+    )
     for path in paths:
         suffix = index.get_tag_value(path, "suffix")
         if suffix is None:

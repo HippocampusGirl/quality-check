@@ -1,7 +1,7 @@
 import sqlite3
-from collections import Counter
+from collections import Counter, defaultdict
 from contextlib import AbstractContextManager
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from itertools import chain
 from subprocess import check_call
 from types import TracebackType
@@ -14,7 +14,7 @@ from file_index.bids import BIDSIndex
 class Datastore(AbstractContextManager[None]):
     database: str
 
-    connection: sqlite3.Connection = field(init=False)
+    connection: sqlite3.Connection | None = None
 
     def __enter__(self) -> None:
         self.connection = self.connect()
@@ -40,7 +40,7 @@ class Datastore(AbstractContextManager[None]):
                 CREATE TABLE IF NOT EXISTS string (
                     id INTEGER PRIMARY KEY,
                     data TEXT NOT NULL UNIQUE
-                ) STRICT;
+                ) STRICT
                 """
             )
             cursor.execute(
@@ -50,7 +50,7 @@ class Datastore(AbstractContextManager[None]):
                     direction TEXT,
                     i INTEGER,
                     data BLOB NOT NULL
-                ) STRICT;
+                ) STRICT
                 """
             )
             cursor.execute(
@@ -61,7 +61,7 @@ class Datastore(AbstractContextManager[None]):
                     value_id TEXT NOT NULL,
                     FOREIGN KEY (key_id) REFERENCES string (id),
                     FOREIGN KEY (value_id) REFERENCES string (id)
-                ) STRICT;
+                ) STRICT
                 """
             )
             cursor.execute(
@@ -72,13 +72,14 @@ class Datastore(AbstractContextManager[None]):
                     PRIMARY KEY (image_id, tag_id),
                     FOREIGN KEY (image_id) REFERENCES image (id),
                     FOREIGN KEY (tag_id) REFERENCES tag (id)
-                ) STRICT;
+                ) STRICT
                 """
             )
         return connection
 
     def close(self) -> None:
-        self.connection.close()
+        if self.connection is not None:
+            self.connection.close()
 
     def set_tags_from_index(self, index: BIDSIndex) -> None:
         tag_counter = Counter(
@@ -91,6 +92,8 @@ class Datastore(AbstractContextManager[None]):
 
     def set_tags(self, tags: Iterable[tuple[str, str]]) -> None:
         connection = self.connection
+        if connection is None:
+            raise ValueError("Connection is not open")
         with connection:
             cursor = connection.cursor()
 
@@ -113,7 +116,7 @@ class Datastore(AbstractContextManager[None]):
                         data
                     ) VALUES (
                         ?
-                    );
+                    )
                     """,
                     ((s,) for s in strings),
                 )
@@ -125,7 +128,7 @@ class Datastore(AbstractContextManager[None]):
                     value.data
                 FROM tag
                     LEFT JOIN string key ON tag.key_id = key.id
-                    LEFT JOIN string value ON tag.value_id = value.id;
+                    LEFT JOIN string value ON tag.value_id = value.id
             """
             )
             tags_in_datastore = set(cursor.fetchall())
@@ -141,13 +144,16 @@ class Datastore(AbstractContextManager[None]):
                     ) VALUES (
                         (SELECT id FROM string WHERE data = ?),
                         (SELECT id FROM string WHERE data = ?)
-                    );
+                    )
                     """,
                     tags,
                 )
 
-    def get_image_ids(self, tags: Mapping[str, str]) -> list[str]:
-        cursor = self.connection.cursor()
+    def get_image_ids(self, tags: Mapping[str, str]) -> set[int]:
+        connection = self.connection
+        if connection is None:
+            raise ValueError("Connection is not open")
+        cursor = connection.cursor()
 
         join = " ".join(
             f"""
@@ -178,10 +184,45 @@ class Datastore(AbstractContextManager[None]):
             """,
             tuple(chain.from_iterable(tags.items())),
         )
-        return list(chain.from_iterable(cursor.fetchall()))
+        return set(chain.from_iterable(cursor.fetchall()))
 
     def has_image(self, tags: Mapping[str, str]) -> bool:
         return bool(self.get_image_ids(tags))
+
+    def get_image_ids_by_tags(self) -> dict[frozenset[tuple[str, str]], set[int]]:
+        connection = self.connection
+        if connection is None:
+            raise ValueError("Connection is not open")
+        cursor = connection.cursor()
+
+        cursor.execute(
+            """
+            SELECT
+                image_id, key.data, value.data
+            FROM image_tag
+                LEFT JOIN tag ON tag.id = tag_id
+                LEFT JOIN string key ON tag.key_id = key.id
+                LEFT JOIN string value ON tag.value_id = value.id
+            """
+        )
+        tags_by_image: dict[int, set[tuple[str, str]]] = defaultdict(set)
+        for image_id, key, value in cursor.fetchall():
+            tags_by_image[image_id].add((key, value))
+
+        images_by_tags: dict[frozenset[tuple[str, str]], set[int]] = defaultdict(set)
+        for image_id, image_tags in tags_by_image.items():
+            images_by_tags[frozenset(image_tags)].add(image_id)
+        return images_by_tags
+
+    def get_direction_and_index(self, image_id: int) -> tuple[str | None, int | None]:
+        connection = self.connection
+        if connection is None:
+            raise ValueError("Connection is not open")
+        cursor = connection.cursor()
+
+        cursor.execute("SELECT direction, i FROM image WHERE id = ?", (image_id,))
+        direction, i = cursor.fetchone()
+        return direction, i
 
     def add_image(
         self,
@@ -190,14 +231,17 @@ class Datastore(AbstractContextManager[None]):
         i: int | None,
         tags: Mapping[str, str],
     ) -> None:
-        cursor = self.connection.cursor()
+        connection = self.connection
+        if connection is None:
+            raise ValueError("Connection is not open")
+        cursor = connection.cursor()
         cursor.execute(
             """
             INSERT INTO image(
                 direction, i, data
             ) VALUES (
                 ?, ?, ?
-            );
+            )
             """,
             (direction, i, data),
         )
@@ -222,7 +266,16 @@ class Datastore(AbstractContextManager[None]):
                     AND
                         value_id = (SELECT id FROM string WHERE data = ?)
                 )
-            );
+            )
             """,
             ((image_id, key, value) for key, value in tags.items()),
         )
+
+    def remove_image(self, image_id: int) -> None:
+        connection = self.connection
+        if connection is None:
+            raise ValueError("Connection is not open")
+        cursor = connection.cursor()
+
+        cursor.execute("DELETE FROM image WHERE id = ?", (image_id,))
+        cursor.execute("DELETE FROM image_tag WHERE image_id = ?", (image_id,))
