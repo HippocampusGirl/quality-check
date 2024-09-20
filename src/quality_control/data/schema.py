@@ -323,31 +323,6 @@ class Datastore(AbstractContextManager[None]):
                 (direction,)
             )
             return cursor.fetchall()
-
-    def detect_anomalies(self, direction: str, z_score_threshold: float = 3.0):
-        images = self.get_images_by_direction(direction)
-        grouped_images = defaultdict(list)
-        
-        for img_id, _, i, img_data in images:
-            decompressed_img = decompress_image(img_data)
-            mean_intensity = np.mean(decompressed_img)
-            std_intensity = np.std(decompressed_img)
-            grouped_images[i].append((img_id, mean_intensity, std_intensity))
-
-        anomalies = []
-        
-        for i, group in grouped_images.items():
-            mean_intensities = [img[1] for img in group]
-            std_intensities = [img[2] for img in group]
-            
-            z_scores_mean = np.abs(stats.zscore(mean_intensities))
-            z_scores_std = np.abs(stats.zscore(std_intensities))
-            
-            for j, (img_id, _, _) in enumerate(group):
-                if z_scores_mean[j] > z_score_threshold or z_scores_std[j] > z_score_threshold:
-                    anomalies.append((img_id, direction, i))
-
-        return anomalies
     
     def get_image_ids_by_suffix(self) -> dict[str, set[int]]:
         images_by_tags = self.get_image_ids_by_tags()
@@ -366,41 +341,6 @@ class Datastore(AbstractContextManager[None]):
             for img_id in image_ids
             if all(self.get_direction_and_index(img_id))
         ]
-
-    def detect_outliers_for_suffix_old(self, suffix: str, z_score_threshold: float = 3.0) -> list[tuple[str, str, int, int]]:
-        images_by_suffix = self.get_image_ids_by_suffix()
-        image_ids = images_by_suffix[suffix]
-        direction_i_data = self.get_direction_i_for_images(image_ids)
-
-        grouped_data = defaultdict(lambda: defaultdict(list))
-        for img_id, direction, i in direction_i_data:
-            grouped_data[direction][i].append(img_id)
-
-        # print(f"suffix {suffix} grouped_data: {grouped_data}")
-        outliers = []
-        for direction in grouped_data:
-            for i, img_ids in grouped_data[direction].items():
-                intensities = []
-                for j,img_id in enumerate(img_ids):
-                    cursor = self.connection.cursor()
-                    cursor.execute("SELECT data FROM image WHERE id = ?", (img_id,))
-                    img_data = cursor.fetchone()[0]
-                    decompressed_img = decompress_image(img_data)
-                    if j == 0 and suffix == "skull_strip_report":
-                        print(f"inverting img {img_id}")
-                        inverted_img = np.invert(decompressed_img)
-                        mean_intensity = np.mean(inverted_img)
-                        intensities.append(mean_intensity)
-                        continue
-                    mean_intensity = np.mean(decompressed_img)
-                    intensities.append(mean_intensity)
-
-                z_scores = np.abs(stats.zscore(intensities))
-                for idx, z_score in enumerate(z_scores):
-                    if z_score > z_score_threshold:
-                        outliers.append((suffix, direction, i, img_ids[idx]))
-
-        return outliers
     
     def detect_outliers_for_suffix(self, suffix: str, method: str, z_score_threshold: float = 3.0) -> list[tuple[str, str, int, int]]:
         images_by_suffix = self.get_image_ids_by_suffix()
