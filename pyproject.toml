@@ -15,8 +15,11 @@ build-backend = "setuptools.build_meta"
 version_scheme = "no-guess-dev"
 
 [tool.pixi.project]
-channels = ["conda-forge"]
-platforms = ["linux-64", "osx-64"]
+channels = ["conda-forge", "pytorch"]
+platforms = ["linux-64"]
+
+[tool.pixi.system-requirements]
+cuda = "12"
 
 [tool.pixi.pypi-dependencies]
 machine-learning = { path = ".", editable = true }
@@ -24,37 +27,34 @@ machine-learning = { path = ".", editable = true }
 [tool.pixi.tasks]
 
 [tool.pixi.dependencies]
+cuda-version = "12.*"
+
 numpy = "*"
 pandas = "*"
 scipy = "*"
 tqdm = "*"
 cairosvg = "*"
-pillow = "*"
 types-pillow = "*"
+
+accelerate = "*"
 diffusers = "*"
 safetensors = "*"
-pytorch = "*"
-torchvision = "*"
-jax = "*"
-jaxtyping = "*"
-jaxlib = "*"
-etils = "*"
-chex = "*"
-flax = "*"
-numpyro = "*"
+transformers = "*"
+
+pytorch = { channel = "pytorch", version = "*", build = "*cuda*" }
+torchvision = { channel = "pytorch", version = "*" }
+torchtriton = { channel = "pytorch", version = "*" }
+
+lightning = "*"
+optuna = "*"
+tensorboard = "*"
+
 zstandard = "*"
 sqlite = ">=3.46.0"
 
-[tool.pixi.feature.gpu]
-platforms = ["linux-64"]
-system-requirements = { cuda = "12" }
-
-[tool.pixi.feature.gpu.dependencies]
-cuda-version = "12.*"
-pytorch = { version = "*", build = "*cuda*" }
-
 [tool.pixi.feature.notebooks.dependencies]
 jupyterlab = "*"
+ipywidgets = "*"
 mypy = "*"
 ruff = "*"
 

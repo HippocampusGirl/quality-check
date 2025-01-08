@@ -156,7 +156,8 @@ def make_transform(
     scale_matrix[1, 1] = image_height / image.shape[0]
 
     image_transform = element.getAttribute("transform")
-    return parse_transform(image_transform) @ translation_matrix @ scale_matrix
+    matrix = parse_transform(image_transform) @ translation_matrix @ scale_matrix
+    return matrix.astype(np.float64)
 
 
 def prepare_path_for_raster(
@@ -205,7 +206,9 @@ def parse_segmentation(image_path: str | Path, colors: list[str]) -> Iterator[Re
             output_height=background_image.shape[0],
             output_width=background_image.shape[1],
         )
-        inverse_transform = np.linalg.inv(make_transform(element, background_image))
+        inverse_transform = np.linalg.inv(
+            make_transform(element, background_image)
+        ).astype(np.float64)
         paths_by_color: dict[str, list[Element]] = defaultdict(list)
         for element in axes.childNodes:
             if not isinstance(element, Element):

@@ -3,7 +3,6 @@ from collections import Counter, defaultdict
 from contextlib import AbstractContextManager
 from dataclasses import dataclass
 from itertools import chain
-from subprocess import check_call
 from types import TracebackType
 from typing import Iterable, Mapping
 
@@ -12,7 +11,7 @@ from file_index.bids import BIDSIndex
 
 @dataclass
 class Datastore(AbstractContextManager[None]):
-    database: str
+    database_uri: str
 
     connection: sqlite3.Connection | None = None
 
@@ -27,12 +26,8 @@ class Datastore(AbstractContextManager[None]):
     ) -> None:
         self.close()
 
-    def vacuum(self) -> None:
-        self.close()
-        check_call(["sqlite3", self.database, "VACUUM"])
-
     def connect(self) -> sqlite3.Connection:
-        connection = sqlite3.connect(self.database, autocommit=False)
+        connection = sqlite3.connect(self.database_uri, autocommit=False, uri=True)
         with connection:
             cursor = connection.cursor()
             cursor.execute(
@@ -213,6 +208,18 @@ class Datastore(AbstractContextManager[None]):
         for image_id, image_tags in tags_by_image.items():
             images_by_tags[frozenset(image_tags)].add(image_id)
         return images_by_tags
+
+    def get_image(self, image_id: int) -> bytes:
+        connection = self.connection
+        if connection is None:
+            raise ValueError("Connection is not open")
+        cursor = connection.cursor()
+
+        cursor.execute("SELECT data FROM image WHERE id = ?", (image_id,))
+        (data,) = cursor.fetchone()
+        if not isinstance(data, bytes):
+            raise ValueError("Data is not bytes")
+        return data
 
     def get_direction_and_index(self, image_id: int) -> tuple[str | None, int | None]:
         connection = self.connection

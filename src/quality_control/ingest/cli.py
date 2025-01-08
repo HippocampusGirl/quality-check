@@ -114,7 +114,7 @@ def main() -> None:
 def parse_arguments(argv: list[str]) -> Namespace:
     argument_parser = ArgumentParser()
 
-    argument_parser.add_argument("--database", required=True)
+    argument_parser.add_argument("--database-uri", required=True)
     argument_parser.add_argument("--dataset", required=True)
     argument_parser.add_argument("--suffix", required=False)
 
@@ -181,7 +181,7 @@ def generate_jobs(
 
 
 def ingest(arguments: Namespace) -> None:
-    database_path = Path(arguments.database)
+    database_uri: str = arguments.database_uri
 
     dataset_path = Path(arguments.dataset)
     index = BIDSIndex()
@@ -189,7 +189,7 @@ def ingest(arguments: Namespace) -> None:
     for path in index.paths - index.get(extension=".svg"):
         index.remove(path)
 
-    datastore = Datastore(database=str(database_path))
+    datastore = Datastore(database_uri=database_uri)
 
     query = dict(extension=".svg")
     if arguments.suffix:
