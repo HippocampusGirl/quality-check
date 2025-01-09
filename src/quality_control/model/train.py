@@ -1,5 +1,5 @@
 import sys
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from typing import Any, Type
@@ -135,7 +135,6 @@ class Trainer:
                 retry_trial_number = trial_number
                 break
 
-        state = TrainingState()
         if artifact_id is not None:
             with TemporaryDirectory() as temporary_directory_str:
                 path = Path(temporary_directory_str) / "model.pt"
@@ -144,13 +143,13 @@ class Trainer:
                     file_path=str(path),
                     artifact_id=artifact_id,
                 )
-                checkpoint = torch.load(path)
-            epoch_index = checkpoint["epoch"]
-            state.epoch_index = epoch_index + 1
+                checkpoint = torch.load(path, weights_only=True)
+            state = TrainingState(**checkpoint["training_state_dict"])
+            state.epoch_index += 1
 
             logger.info(
                 f"Resuming model {model} from trial {retry_trial_number} "
-                f"in epoch {epoch}"
+                f"in epoch {state.epoch_index}"
             )
 
             model.load_state_dict(checkpoint["model_state_dict"])
@@ -158,10 +157,11 @@ class Trainer:
             r2 = checkpoint["r2"]
         else:
             logger.info(f"Training model {model}")
-            state.epoch_index = 0
+            state = TrainingState()
 
-        for epoch_index in range(self.epoch_count):
+        for epoch_index in range(state.epoch_index, self.epoch_count):
             state.epoch_index = epoch_index
+
             epoch(
                 state,
                 self.accelerator,
@@ -181,7 +181,7 @@ class Trainer:
                 path = Path(temporary_directory_str) / "model.pt"
                 torch.save(
                     {
-                        "epoch": epoch,
+                        "training_state_dict": asdict(state),
                         "model_state_dict": model.state_dict(),
                         "optimizer_state_dict": optimizer.state_dict(),
                         "r2": r2,

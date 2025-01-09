@@ -90,7 +90,7 @@ def run_train(
         pruner = optuna.pruners.HyperbandPruner()
         storage = optuna.storages.RDBStorage(
             arguments.optuna_database_uri,
-            heartbeat_interval=60,
+            heartbeat_interval=1,
             grace_period=120,
             failed_trial_callback=RetryFailedTrialCallback(
                 inherit_intermediate_values=True
