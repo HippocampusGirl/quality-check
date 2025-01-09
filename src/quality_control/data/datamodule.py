@@ -1,10 +1,11 @@
 from functools import partial
 from itertools import chain
-from typing import Any, ClassVar, TypeAlias
+from typing import Any, ClassVar, Iterable, Sized, TypeAlias
 
 import numpy as np
 import torch
 from lightning.pytorch import LightningDataModule
+from numpy import typing as npt
 from torch.utils.data import (
     ConcatDataset,
     DataLoader,
@@ -26,6 +27,13 @@ from .dataset import (
 from .schema import Datastore
 
 
+def get_weights(datasets: Iterable[Sized]) -> npt.NDArray[np.float32]:
+    return np.fromiter(
+        chain.from_iterable([1 / len(dataset)] * len(dataset) for dataset in datasets),
+        dtype=np.float32,
+    )
+
+
 class BaseDataModule(LightningDataModule):
     classes: list[tuple[np.uint8, ...]]
 
@@ -39,14 +47,20 @@ class BaseDataModule(LightningDataModule):
         image_types: list[ImageType],
         preprocess: transforms.Transform,
         lengths: tuple[float, float, float],
-        batch_size: int,
+        train_batch_size: int,
+        eval_batch_size: int,
     ):
         super().__init__()
 
         self.generator = generator
-        self.preprocess = preprocess
+
+        self.preprocess: Any = torch.compile(preprocess)
+
         self.lengths = lengths
-        self.batch_size = batch_size
+
+        self.train_batch_size = train_batch_size
+        self.eval_batch_size = eval_batch_size
+
         if {self.channel_count} != {
             len(channels_by_image_type[image_type]) for image_type in image_types
         }:
@@ -63,14 +77,9 @@ class BaseDataModule(LightningDataModule):
                 for _, position, _ in dataset.images
             }
         )
-        good_dataset: _Dataset[Image] = ConcatDataset(good_datasets.values())
-        self.weights = np.fromiter(
-            chain.from_iterable(
-                [1 / len(dataset)] * len(dataset) for dataset in good_datasets.values()
-            ),
-            dtype=np.float32,
-        )
+        self.good_weights = get_weights(good_datasets.values())
 
+        good_dataset: _Dataset[Image] = ConcatDataset(good_datasets.values())
         tensor_dataset_factory = partial(TensorDataset, self)
         self.train_dataset, val_dataset_good, test_dataset_good = map(
             tensor_dataset_factory,
@@ -81,6 +90,8 @@ class BaseDataModule(LightningDataModule):
             image_type: ImageDataset(datastore, label="bad", suffix=image_type.name)
             for image_type in image_types
         }
+        self.bad_weights = get_weights(bad_datasets.values())
+
         bad_dataset: _Dataset[Image] = ConcatDataset(bad_datasets.values())
         bad_lengths = tuple(
             length / sum(self.lengths[1:]) for length in self.lengths[1:]
@@ -92,19 +103,40 @@ class BaseDataModule(LightningDataModule):
         self.val_dataset = GoodBadDataset(val_dataset_good, val_dataset_bad)
         self.test_dataset = GoodBadDataset(test_dataset_good, test_dataset_bad)
 
+    @property
+    def dataloader_kwargs(self) -> dict[str, Any]:
+        return dict(
+            drop_last=True,
+            generator=self.generator,
+            # num_workers=cpu_count(),
+            # multiprocessing_context="spawn",
+        )
+
     def train_dataloader(
         self,
     ) -> DataLoader[tuple[torch.Tensor, torch.Tensor]]:
         dataset = self.train_dataset
-        batch_size = self.batch_size
-        weights = self.weights[dataset.subset.indices]
-        sampler = WeightedRandomSampler(list(weights), len(dataset), replacement=True)
-        return DataLoader(dataset, batch_size=batch_size, sampler=sampler)
+        weights = self.good_weights[dataset.subset.indices]
+        sampler = WeightedRandomSampler(
+            list(weights), len(dataset), replacement=True, generator=self.generator
+        )
+        return DataLoader(
+            dataset, self.train_batch_size, sampler=sampler, **self.dataloader_kwargs
+        )
 
     def get_data_loader(
         self, dataset: "GoodBadDataset"
     ) -> DataLoader[tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
-        return DataLoader(dataset, batch_size=self.batch_size)
+        good_dataset, bad_dataset = dataset.good_dataset, dataset.bad_dataset
+        weights = get_weights([good_dataset, bad_dataset])
+        weights[: len(good_dataset)] *= self.good_weights[good_dataset.subset.indices]
+        weights[len(good_dataset) :] *= self.bad_weights[bad_dataset.subset.indices]
+        sampler = WeightedRandomSampler(
+            list(weights), len(dataset), replacement=True, generator=self.generator
+        )
+        return DataLoader(
+            dataset, self.eval_batch_size, sampler=sampler, **self.dataloader_kwargs
+        )
 
     def val_dataloader(
         self,
@@ -130,9 +162,12 @@ class TensorDataset(_Dataset[tuple[torch.Tensor, torch.Tensor]]):
         class_label = self.data_module.classes.index(
             (*tuple(image.channels), *tuple(image.position))
         )
-        return self.data_module.preprocess(image.data), torch.tensor(class_label)
+        tensor = torch.tensor(image.data).permute(2, 0, 1)
+        data = self.data_module.preprocess(tensor)
+        return data, torch.tensor(class_label)
 
 
+# Maybe use StackDataset instead of GoodBadDataset
 class GoodBadDataset(_Dataset[tuple[torch.Tensor, torch.Tensor, torch.Tensor]]):
     def __init__(self, good_dataset: TensorDataset, bad_dataset: TensorDataset):
         self.good_dataset = good_dataset
@@ -164,20 +199,26 @@ class SliceDataModule(BaseDataModule):
         image_types: list[ImageType],
         lengths: tuple[float, float, float],
         image_size: int,
-        batch_size: int,
+        train_batch_size: int,
+        eval_batch_size: int,
     ):
         preprocess = transforms.Compose(
             [
-                transforms.ToImage(),
-                transforms.ToDtype(torch.float32, scale=True),
                 transforms.Resize(None, max_size=image_size),
                 transforms.CenterCrop(size=(image_size, image_size)),
                 transforms.RandomHorizontalFlip(p=0.5),
                 transforms.ElasticTransform(alpha=100.0, sigma=10.0),
+                transforms.ToDtype(torch.float32, scale=True),
             ]
         )
         super().__init__(
-            datastore, generator, image_types, preprocess, lengths, batch_size
+            datastore,
+            generator,
+            image_types,
+            preprocess,
+            lengths,
+            train_batch_size,
+            eval_batch_size,
         )
 
 
@@ -191,11 +232,18 @@ class DataModule1(SliceDataModule):
         generator: torch.Generator,
         lengths: tuple[float, float, float],
         image_size: int,
-        batch_size: int,
+        train_batch_size: int,
+        eval_batch_size: int,
     ):
         image_types = [ImageType.skull_strip_report, ImageType.tsnr_rpt]
         super().__init__(
-            datastore, generator, image_types, lengths, image_size, batch_size
+            datastore,
+            generator,
+            image_types,
+            lengths,
+            image_size,
+            train_batch_size,
+            eval_batch_size,
         )
 
 
@@ -209,11 +257,18 @@ class DataModule2(SliceDataModule):
         generator: torch.Generator,
         lengths: tuple[float, float, float],
         image_size: int,
-        batch_size: int,
+        train_batch_size: int,
+        eval_batch_size: int,
     ):
         image_types = [ImageType.t1_norm_rpt, ImageType.epi_norm_rpt]
         super().__init__(
-            datastore, generator, image_types, lengths, image_size, batch_size
+            datastore,
+            generator,
+            image_types,
+            lengths,
+            image_size,
+            train_batch_size,
+            eval_batch_size,
         )
 
 
@@ -261,20 +316,26 @@ class DataModule3(BaseDataModule):
         generator: torch.Generator,
         lengths: tuple[float, float, float],
         image_size: int,
-        batch_size: int,
+        train_batch_size: int,
+        eval_batch_size: int,
     ):
         preprocess = transforms.Compose(
             [
-                transforms.ToImage(),
-                transforms.ToDtype(torch.float32, scale=True),
                 RandomHorizontalResizedCrop(
                     size=(image_size, image_size), scale=(0.3, 1.0)
                 ),
+                transforms.ToDtype(torch.float32, scale=True),
             ]
         )
         image_types = [ImageType.bold_conf]
         super().__init__(
-            datastore, generator, image_types, preprocess, lengths, batch_size
+            datastore,
+            generator,
+            image_types,
+            preprocess,
+            lengths,
+            train_batch_size,
+            eval_batch_size,
         )
 
 

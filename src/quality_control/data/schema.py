@@ -75,6 +75,7 @@ class Datastore(AbstractContextManager[None]):
     def close(self) -> None:
         if self.connection is not None:
             self.connection.close()
+            self.connection = None
 
     def set_tags_from_index(self, index: BIDSIndex) -> None:
         tag_counter = Counter(
