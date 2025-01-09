@@ -128,9 +128,11 @@ class BaseDataModule(LightningDataModule):
         self, dataset: "GoodBadDataset"
     ) -> DataLoader[tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
         good_dataset, bad_dataset = dataset.good_dataset, dataset.bad_dataset
-        weights = get_weights([good_dataset, bad_dataset])
-        weights[: len(good_dataset)] *= self.good_weights[good_dataset.subset.indices]
-        weights[len(good_dataset) :] *= self.bad_weights[bad_dataset.subset.indices]
+        good_weights = self.good_weights[good_dataset.subset.indices]
+        good_weights /= good_weights.sum()
+        bad_weights = self.bad_weights[bad_dataset.subset.indices]
+        bad_weights /= bad_weights.sum()
+        weights = np.hstack([good_weights, bad_weights])
         sampler = WeightedRandomSampler(
             list(weights), len(dataset), replacement=True, generator=self.generator
         )

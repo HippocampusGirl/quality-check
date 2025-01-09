@@ -49,7 +49,9 @@ def evaluate(
         good_bad_labels = torch.cat((good_bad_labels, _good_bad_labels), dim=0)
         loss_values = torch.cat((loss_values, _loss_values), dim=0)
 
-        if good_bad_labels.sum().item() > 10:  # Stop early
+        good_count = (good_bad_labels == 0).sum().item()
+        bad_count = (good_bad_labels == 1).sum().item()
+        if min(good_count, bad_count) > 10:  # Stop early
             break
 
     # T-test for difference by label
@@ -57,4 +59,6 @@ def evaluate(
         good_bad_labels.cpu().numpy(), loss_values.cpu().numpy()
     )
     r = pearsonr.statistic
+    if not np.isfinite(r):
+        raise ValueError
     return float(np.square(r))

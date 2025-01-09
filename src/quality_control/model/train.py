@@ -1,3 +1,4 @@
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -106,11 +107,7 @@ class Trainer:
     accelerator: Accelerator = Accelerator(
         mixed_precision="bf16",
         gradient_accumulation_steps=1,
-        # dynamo_backend="eager",
-        # dynamo_backend="aot_eager",
         dynamo_backend="inductor",
-        # dynamo_backend="openxla",
-        # log_with="tensorboard",
     )
 
     @property
@@ -196,7 +193,7 @@ class Trainer:
                     file_path=str(path),
                     study_or_trial=trial,
                 )
-                trial.set_user_attr("artifact_id", artifact_id)
+            trial.set_user_attr("artifact_id", artifact_id)
 
             if trial.should_prune():
                 raise optuna.TrialPruned()
@@ -259,6 +256,8 @@ class Trainer:
             logger.info("Out of memory", exc_info=e, stack_info=False)
             trial.set_user_attr("constraint", (1,))
             return -1.0
+        except KeyboardInterrupt:
+            sys.exit(1)  # Exit without marking the trial as failed
         finally:
             self.accelerator.free_memory()
 

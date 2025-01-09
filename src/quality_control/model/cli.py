@@ -23,7 +23,7 @@ def parse_arguments(argv: list[str]) -> Namespace:
 
     argument_parser.add_argument("--epoch-count", type=int, default=50)
     argument_parser.add_argument("--train-batch-size", type=int, default=16)
-    argument_parser.add_argument("--eval-batch-size", type=int, default=32)
+    argument_parser.add_argument("--eval-batch-size", type=int, default=16)
     argument_parser.add_argument("--timestep-count", type=int, default=1000)
     argument_parser.add_argument("--seed", type=int, default=0)
 
@@ -90,7 +90,8 @@ def run_train(
         pruner = optuna.pruners.HyperbandPruner()
         storage = optuna.storages.RDBStorage(
             arguments.optuna_database_uri,
-            heartbeat_interval=1,
+            heartbeat_interval=60,
+            grace_period=120,
             failed_trial_callback=RetryFailedTrialCallback(
                 inherit_intermediate_values=True
             ),
