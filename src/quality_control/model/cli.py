@@ -19,10 +19,10 @@ def parse_arguments(argv: list[str]) -> Namespace:
     )
     argument_parser.add_argument("--optuna-study-name", type=str, required=True)
     argument_parser.add_argument("--trial-count", type=int, default=100)
-    argument_parser.add_argument("--timeout", type=int, default=10000)
 
     argument_parser.add_argument("--epoch-count", type=int, default=50)
     argument_parser.add_argument("--train-batch-size", type=int, default=16)
+    argument_parser.add_argument("--gradient-accumulation-steps", type=int, default=1)
     argument_parser.add_argument("--eval-batch-size", type=int, default=16)
     argument_parser.add_argument("--timestep-count", type=int, default=1000)
     argument_parser.add_argument("--seed", type=int, default=0)
@@ -58,11 +58,6 @@ def run_train(
 
         datastore = Datastore(database_uri=arguments.datastore_database_uri)
 
-        import torch
-
-        logger.info(f"{torch.cuda.get_device_capability()=}")
-        torch._dynamo.config.cache_size_limit = 64
-
         from optuna.artifacts import FileSystemArtifactStore
 
         artifact_store = FileSystemArtifactStore(arguments.optuna_artifact_store_path)
@@ -77,6 +72,7 @@ def run_train(
             artifact_store=artifact_store,
             data_module_class=data_module_class,
             train_batch_size=arguments.train_batch_size,
+            gradient_accumulation_steps=arguments.gradient_accumulation_steps,
             eval_batch_size=arguments.eval_batch_size,
             timestep_count=arguments.timestep_count,
             seed=arguments.seed,
@@ -107,7 +103,6 @@ def run_train(
         study.optimize(
             trainer.objective,
             n_trials=arguments.trial_count,
-            timeout=arguments.timeout,
             gc_after_trial=True,
         )
     except Exception as e:

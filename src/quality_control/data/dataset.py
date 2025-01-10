@@ -5,6 +5,7 @@ from operator import attrgetter
 import numpy as np
 from numpy import typing as npt
 from torch.utils.data import Dataset as _Dataset
+from tqdm.auto import tqdm
 
 from .compression import decompress_image
 from .schema import Datastore
@@ -98,7 +99,7 @@ class ImageDataset(_Dataset[Image]):
 
         with self.datastore:
             image_ids_by_tags = datastore.get_image_ids_by_tags()
-            for tags_set, image_ids in image_ids_by_tags.items():
+            for tags_set, image_ids in tqdm(image_ids_by_tags.items(), leave=False):
                 if not self.query.issubset(tags_set):
                     continue
                 tags = dict(tags_set)

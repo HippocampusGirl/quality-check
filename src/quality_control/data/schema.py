@@ -1,7 +1,7 @@
 import sqlite3
 from collections import Counter, defaultdict
 from contextlib import AbstractContextManager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from itertools import chain
 from types import TracebackType
 from typing import Iterable, Mapping
@@ -14,6 +14,10 @@ class Datastore(AbstractContextManager[None]):
     database_uri: str
 
     connection: sqlite3.Connection | None = None
+    image_ids_by_tags: dict[frozenset[tuple[str, str]], set[int]] | None = None
+    direction_and_index: dict[int, tuple[str | None, int | None]] = field(
+        default_factory=dict
+    )
 
     def __enter__(self) -> None:
         self.connection = self.connect()
@@ -186,6 +190,9 @@ class Datastore(AbstractContextManager[None]):
         return bool(self.get_image_ids(tags))
 
     def get_image_ids_by_tags(self) -> dict[frozenset[tuple[str, str]], set[int]]:
+        if self.image_ids_by_tags is not None:
+            return self.image_ids_by_tags
+
         connection = self.connection
         if connection is None:
             raise ValueError("Connection is not open")
@@ -201,14 +208,16 @@ class Datastore(AbstractContextManager[None]):
                 LEFT JOIN string value ON tag.value_id = value.id
             """
         )
-        tags_by_image: dict[int, set[tuple[str, str]]] = defaultdict(set)
+        tags_by_image_id: dict[int, set[tuple[str, str]]] = defaultdict(set)
         for image_id, key, value in cursor.fetchall():
-            tags_by_image[image_id].add((key, value))
+            tags_by_image_id[image_id].add((key, value))
 
-        images_by_tags: dict[frozenset[tuple[str, str]], set[int]] = defaultdict(set)
-        for image_id, image_tags in tags_by_image.items():
-            images_by_tags[frozenset(image_tags)].add(image_id)
-        return images_by_tags
+        image_ids_by_tags: dict[frozenset[tuple[str, str]], set[int]] = defaultdict(set)
+        for image_id, image_tags in tags_by_image_id.items():
+            image_ids_by_tags[frozenset(image_tags)].add(image_id)
+
+        self.image_ids_by_tags = image_ids_by_tags
+        return image_ids_by_tags
 
     def get_image(self, image_id: int) -> bytes:
         connection = self.connection
@@ -223,6 +232,9 @@ class Datastore(AbstractContextManager[None]):
         return data
 
     def get_direction_and_index(self, image_id: int) -> tuple[str | None, int | None]:
+        if self.direction_and_index.get(image_id) is not None:
+            return self.direction_and_index[image_id]
+
         connection = self.connection
         if connection is None:
             raise ValueError("Connection is not open")
@@ -230,6 +242,7 @@ class Datastore(AbstractContextManager[None]):
 
         cursor.execute("SELECT direction, i FROM image WHERE id = ?", (image_id,))
         direction, i = cursor.fetchone()
+        self.direction_and_index[image_id] = direction, i
         return direction, i
 
     def add_image(

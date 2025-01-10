@@ -55,7 +55,6 @@ def get_model(
         norm_num_groups=norm_group_count,
         num_class_embeds=class_count,
     )  # type: ignore
-    model.enable_xformers_memory_efficient_attention()
 
     return model
 

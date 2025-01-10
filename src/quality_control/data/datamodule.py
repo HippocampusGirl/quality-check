@@ -17,6 +17,7 @@ from torch.utils.data import Dataset as _Dataset
 from torchvision.transforms import v2 as transforms
 from torchvision.transforms.v2 import InterpolationMode
 
+from ..utils import cpu_count
 from .dataset import (
     Image,
     ImageDataset,
@@ -54,7 +55,14 @@ class BaseDataModule(LightningDataModule):
 
         self.generator = generator
 
-        self.preprocess: Any = torch.compile(preprocess)
+        if self.generator.device.type == "cpu":
+            self.num_workers = cpu_count()
+        else:
+            self.num_workers = 0
+
+        if generator.device.type == "cuda":
+            preprocess = torch.compile(preprocess)
+        self.preprocess: Any = preprocess
 
         self.lengths = lengths
 
@@ -108,8 +116,9 @@ class BaseDataModule(LightningDataModule):
         return dict(
             drop_last=True,
             generator=self.generator,
-            # num_workers=cpu_count(),
-            # multiprocessing_context="spawn",
+            num_workers=self.num_workers,
+            persistent_workers=self.num_workers > 0,
+            pin_memory=False,
         )
 
     def train_dataloader(

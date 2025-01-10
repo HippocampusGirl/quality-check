@@ -16,7 +16,7 @@ def evaluate(
 ) -> float:
     noise_scheduler = PNDMScheduler()
     noise_scheduler.set_timesteps(num_inference_steps=step_count)  # type: ignore
-    timesteps = noise_scheduler.timesteps  # type: ignore
+    timesteps = noise_scheduler.timesteps.to(model.device)  # type: ignore
 
     good_bad_labels = torch.zeros(0, dtype=torch.int64)
     loss_values = torch.zeros(0, dtype=torch.float32)
@@ -38,7 +38,7 @@ def evaluate(
                     return_dict=False,
                 )
                 (noisy_images,) = noise_scheduler.step(  # type: ignore
-                    predicted_noise, step, noisy_images, return_dict=False
+                    predicted_noise.clone(), step, noisy_images, return_dict=False
                 )
 
             denoised_images = (noisy_images / 2 + 0.5).clamp(0, 1)
@@ -51,7 +51,7 @@ def evaluate(
 
         good_count = (good_bad_labels == 0).sum().item()
         bad_count = (good_bad_labels == 1).sum().item()
-        if min(good_count, bad_count) > 10:  # Stop early
+        if min(good_count, bad_count) > 20:  # Stop early
             break
 
     # T-test for difference by label

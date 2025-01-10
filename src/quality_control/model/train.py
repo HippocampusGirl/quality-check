@@ -1,5 +1,6 @@
-import sys
-from dataclasses import asdict, dataclass
+import os
+import signal
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from typing import Any, Type
@@ -7,6 +8,7 @@ from typing import Any, Type
 import optuna
 import torch
 from accelerate import Accelerator
+from accelerate.utils import TorchDynamoPlugin
 from diffusers import DDPMScheduler
 from optuna.artifacts import FileSystemArtifactStore, download_artifact, upload_artifact
 from optuna.storages import RetryFailedTrialCallback
@@ -37,6 +39,7 @@ def epoch(
     train_dataloader: DataLoader[tuple[torch.Tensor, torch.Tensor]],
     timestep_count: int,
 ) -> None:
+    device = model.device
     noise_scheduler = DDPMScheduler(num_train_timesteps=timestep_count)
     with tqdm(total=len(train_dataloader), leave=False) as progress_bar:
         progress_bar.set_description(f"Epoch {state.epoch_index + 1}")
@@ -50,6 +53,7 @@ def epoch(
                 timestep_count,
                 (batch_size,),
                 dtype=torch.int64,
+                device=device,
                 generator=generator,
             )
 
@@ -96,19 +100,37 @@ class Trainer:
     data_module_class: Type[DataModule]
 
     train_batch_size: int
+    gradient_accumulation_steps: int
     eval_batch_size: int
 
     seed: int
 
-    timestep_count: int = 1000
-    epoch_count: int = 300
+    timestep_count: int
+    epoch_count: int
 
-    dtype: torch.dtype = torch.float16
-    accelerator: Accelerator = Accelerator(
-        mixed_precision="bf16",
-        gradient_accumulation_steps=1,
-        dynamo_backend="inductor",
-    )
+    accelerator: Accelerator = field(init=False)
+
+    def __post_init__(self) -> None:
+        if torch.cuda.get_device_capability() >= (8, 0):
+            mixed_precision = "bf16"
+        else:
+            mixed_precision = "fp16"
+        # mixed_precision = "fp8"
+        # fp8_recipe_kwargs = FP8RecipeKwargs(backend="msamp", opt_level="02")
+        self.accelerator = Accelerator(
+            mixed_precision=mixed_precision,
+            gradient_accumulation_steps=self.gradient_accumulation_steps,
+            dynamo_plugin=TorchDynamoPlugin(
+                backend="inductor", fullgraph=True, mode="reduce-overhead"
+            ),
+            # kwargs_handlers=[fp8_recipe_kwargs],
+        )
+
+        torch._dynamo.config.cache_size_limit = 64
+
+        device = self.accelerator.device
+        logger.info(f"{device=}")
+        logger.info(f"{torch.cuda.get_device_capability(device)=}")
 
     @property
     def device(self) -> Any:
@@ -172,8 +194,14 @@ class Trainer:
                 train_dataloader,
                 self.timestep_count,
             )
+            optimizer.zero_grad(set_to_none=True)
 
-            r2 = evaluate(model, val_dataloader, step_count=50, step_pruning=5)
+            r2 = evaluate(
+                model,
+                val_dataloader,
+                step_count=50,
+                step_pruning=5,
+            )
             trial.report(r2, state.step_index)
             logger.info(f"Reported {r2=} at {state.step_index=}")
 
@@ -201,69 +229,67 @@ class Trainer:
         return r2
 
     def _objective(self, trial: optuna.trial.Trial) -> float:
+        generator = torch.Generator(device=self.device).manual_seed(self.seed)
+
+        channel_count = self.data_module_class.channel_count
+        class_count = self.data_module_class.class_count
+        model = get_model(trial, channel_count, class_count)
+        parameter_count = model.num_parameters()
+        memory_footprint: float = model.get_memory_footprint(return_buffers=True) / 1e9
+        logger.info(f"{memory_footprint=} {parameter_count=}")
+        # with torch.device(self.device):
+        optimizer = get_optimizer(trial, model)
+
+        data_module = self.data_module_class(
+            self.datastore,
+            generator=torch.Generator(device="cpu").manual_seed(self.seed),
+            lengths=(0.8, 0.15, 0.05),
+            image_size=model.sample_size,
+            train_batch_size=self.train_batch_size,
+            eval_batch_size=self.eval_batch_size,
+        )
+        train_dataloader = data_module.train_dataloader()
+        learning_rate_scheduler = get_learning_rate_scheduler(
+            optimizer, train_dataloader, self.epoch_count
+        )
+        val_dataloader = data_module.val_dataloader()
+
+        (
+            model,
+            optimizer,
+            train_dataloader,
+            val_dataloader,
+            learning_rate_scheduler,
+        ) = self.accelerator.prepare(
+            model,
+            optimizer,
+            train_dataloader,
+            val_dataloader,
+            learning_rate_scheduler,
+        )
+
+        return self.train(
+            trial,
+            generator,
+            model,
+            optimizer,
+            learning_rate_scheduler,
+            train_dataloader,
+            val_dataloader,
+        )
+
+    def objective(self, trial: optuna.trial.Trial) -> float:
         try:
-            generator = torch.Generator(device=self.device).manual_seed(self.seed)
-
-            channel_count = self.data_module_class.channel_count
-            class_count = self.data_module_class.class_count
-
-            model = get_model(trial, channel_count, class_count)
-            memory_footprint = model.get_memory_footprint(return_buffers=True)
-            logger.info(f"{memory_footprint=}")
-            if memory_footprint > (1 << 27):
-                raise torch.OutOfMemoryError
-
-            optimizer = get_optimizer(trial, model)
-
-            data_module = self.data_module_class(
-                self.datastore,
-                generator=generator,
-                lengths=(0.8, 0.15, 0.05),
-                image_size=model.sample_size,
-                train_batch_size=self.train_batch_size,
-                eval_batch_size=self.eval_batch_size,
-            )
-            train_dataloader = data_module.train_dataloader()
-            learning_rate_scheduler = get_learning_rate_scheduler(
-                optimizer, train_dataloader, self.epoch_count
-            )
-            val_dataloader = data_module.val_dataloader()
-
-            (
-                model,
-                optimizer,
-                train_dataloader,
-                val_dataloader,
-                learning_rate_scheduler,
-            ) = self.accelerator.prepare(
-                model,
-                optimizer,
-                train_dataloader,
-                val_dataloader,
-                learning_rate_scheduler,
-            )
-
-            return self.train(
-                trial,
-                generator,
-                model,
-                optimizer,
-                learning_rate_scheduler,
-                train_dataloader,
-                val_dataloader,
-            )
+            r2 = self._objective(trial)
         except (torch.OutOfMemoryError, RuntimeError) as e:
             logger.info("Out of memory", exc_info=e, stack_info=False)
             trial.set_user_attr("constraint", (1,))
             return -1.0
         except KeyboardInterrupt:
-            sys.exit(1)  # Exit without marking the trial as failed
-        finally:
-            self.accelerator.free_memory()
-
-    def objective(self, trial: optuna.trial.Trial) -> float:
-        with torch.device(self.device):
-            return self._objective(trial)
+            # Exit immediately without letting optuna mark the trial as failed
+            os.kill(os.getpid(), signal.SIGKILL)
+        self.accelerator.free_memory()
+        return r2
 
 
 def constraints(trial: optuna.trial.Trial) -> Any:
