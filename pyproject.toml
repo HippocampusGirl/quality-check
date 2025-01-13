@@ -1,7 +1,7 @@
 [project]
 name = "machine-learning"
 dynamic = ["version"]
-requires-python = ">=3.12"
+requires-python = "==3.12"
 dependencies = []
 
 [project.scripts]
@@ -15,20 +15,23 @@ build-backend = "setuptools.build_meta"
 version_scheme = "no-guess-dev"
 
 [tool.pixi.project]
-channels = ["conda-forge", "pytorch"]
+channels = ["https://repo.prefix.dev/conda-forge"]
 platforms = ["linux-64"]
 
 [tool.pixi.system-requirements]
+linux = "4.18"
 cuda = "12"
+
+[tool.pixi.tasks]
+post-install = "pip install 'transformer_engine[pytorch]'"
 
 [tool.pixi.pypi-dependencies]
 machine-learning = { path = ".", editable = true }
 
-[tool.pixi.tasks]
-
 [tool.pixi.dependencies]
-cuda-version = "12.*"
+pip = "*"
 
+matplotlib = "*"
 numpy = "*"
 pandas = "*"
 scipy = "*"
@@ -36,27 +39,47 @@ tqdm = "*"
 cairosvg = "*"
 types-pillow = "*"
 
+psycopg2 = "*"
+sqlite = ">=3.46.0"
+zstandard = "*"
+
+# huggingface
 accelerate = "*"
 diffusers = "*"
 safetensors = "*"
 transformers = "*"
 
-pytorch = { channel = "pytorch", version = "*", build = "*cuda*" }
-torchvision = { channel = "pytorch", version = "*" }
-torchtriton = { channel = "pytorch", version = "*" }
+# pytorch
+pytorch = { version = "*", build = "*cuda*" }
+botorch = "*"
+fvcore = "*"
+iopath = "*"
+torchvision = "*"
+triton = "*"
+c-compiler = "*"
+cxx-compiler = "*"
 
+# nvidia
+cuda-version = "12.6"
+cuda-nvrtc-dev = "*"
+cuda-nvtx-dev = "*"
+libcublas-dev = "*"
+libcusolver-dev = "*"
+libcusparse-dev = "*"
+
+bitsandbytes = "*"
+deepspeed = "*"
 lightning = "*"
 optuna = "*"
+optuna-integration = "*"
 tensorboard = "*"
+torchmetrics = "*"
 
-zstandard = "*"
-sqlite = ">=3.46.0"
-
-[tool.pixi.feature.notebooks.dependencies]
+[tool.pixi.feature.development.dependencies]
 jupyterlab = "*"
 ipywidgets = "*"
 mypy = "*"
 ruff = "*"
 
 [tool.pixi.environments]
-default = { features = ["notebooks"], solve-group = "default" }
+default = { features = ["development"], solve-group = "default" }

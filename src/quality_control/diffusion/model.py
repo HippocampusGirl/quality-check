@@ -1,8 +1,13 @@
+from pprint import pformat
+
+import bitsandbytes
 import optuna
 import torch
 from diffusers import UNet2DModel
 from diffusers.optimization import get_cosine_schedule_with_warmup
 from torch.utils.data import DataLoader
+
+from ..logging import logger
 
 block_types = ["{direction}Block2D", "Attn{direction}Block2D"]
 
@@ -12,7 +17,7 @@ def get_model(
     channel_count: int,
     class_count: int,
 ) -> torch.nn.Module:
-    block_count = trial.suggest_int("block_count", 4, 8)
+    block_count = trial.suggest_int("block_count", 6, 8)
     down_block_types: list[str] = list()
     up_block_types: list[str] = list()
     for i in range(block_count):
@@ -25,7 +30,7 @@ def get_model(
 
     norm_group_count = 32
     block_out_channels_base = 32 * trial.suggest_int(
-        "block_out_channels_factor", 32 // norm_group_count, 512 // norm_group_count
+        "block_out_channels_factor", 32 // norm_group_count, 128 // norm_group_count
     )
     block_out_channels: list[int] = [block_out_channels_base]
     block_out_channels_factor = 1
@@ -37,10 +42,10 @@ def get_model(
 
     image_size_base = 2 ** (block_count - 1)
     image_size = image_size_base * trial.suggest_int(
-        "image_size_factor", 128 // image_size_base, 768 // image_size_base
+        "image_size_factor", 256 // image_size_base, 768 // image_size_base
     )
 
-    model: torch.nn.Module = UNet2DModel(
+    model_kwargs = dict(
         sample_size=image_size,
         in_channels=channel_count,
         out_channels=channel_count,
@@ -54,17 +59,26 @@ def get_model(
         dropout=trial.suggest_float("dropout", 0.0, 0.5),
         norm_num_groups=norm_group_count,
         num_class_embeds=class_count,
-    )  # type: ignore
+    )
+
+    logger.info(
+        f"Creating model {pformat(model_kwargs)}",
+    )
+
+    model: torch.nn.Module = UNet2DModel(**model_kwargs)  # type: ignore
 
     return model
 
 
 def get_optimizer(
-    trial: optuna.trial.Trial, model: torch.nn.Module
+    trial: optuna.trial.Trial, model: torch.nn.Module, suffix: str = ""
 ) -> torch.optim.Optimizer:
-    learning_rate = trial.suggest_float("learning_rate", 1e-5, 5e-2, log=True)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate)
-    return optimizer
+    name = "learning_rate"
+    if suffix:
+        name += f"_{suffix}"
+    learning_rate = trial.suggest_float(name, 1e-5, 5e-2, log=True)
+    optimizer = bitsandbytes.optim.AdamW8bit(model.parameters(), lr=learning_rate)
+    return optimizer  # type: ignore
 
 
 def get_learning_rate_scheduler(

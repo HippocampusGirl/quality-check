@@ -3,6 +3,7 @@ from collections import Counter, defaultdict
 from contextlib import AbstractContextManager
 from dataclasses import dataclass, field
 from itertools import chain
+from pathlib import Path
 from types import TracebackType
 from typing import Iterable, Mapping
 
@@ -13,6 +14,7 @@ from file_index.bids import BIDSIndex
 class Datastore(AbstractContextManager[None]):
     database_uri: str
 
+    cache_path: Path | None = None
     connection: sqlite3.Connection | None = None
     image_ids_by_tags: dict[frozenset[tuple[str, str]], set[int]] | None = None
     direction_and_index: dict[int, tuple[str | None, int | None]] = field(

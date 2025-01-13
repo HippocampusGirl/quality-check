@@ -14,6 +14,8 @@ def evaluate(
     step_count: int,
     step_pruning: int,
 ) -> float:
+    model = model.eval()
+
     noise_scheduler = PNDMScheduler()
     noise_scheduler.set_timesteps(num_inference_steps=step_count)  # type: ignore
     timesteps = noise_scheduler.timesteps.to(model.device)  # type: ignore

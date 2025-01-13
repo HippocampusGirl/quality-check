@@ -15,14 +15,13 @@ from torch.utils.data import (
 )
 from torch.utils.data import Dataset as _Dataset
 from torchvision.transforms import v2 as transforms
-from torchvision.transforms.v2 import InterpolationMode
 
 from ..utils import cpu_count
+from .augmentation import RandomHorizontalResizedCrop
 from .dataset import (
     Image,
     ImageDataset,
     ImageType,
-    channels_by_image_type,
     get_channels,
 )
 from .schema import Datastore
@@ -30,7 +29,9 @@ from .schema import Datastore
 
 def get_weights(datasets: Iterable[Sized]) -> npt.NDArray[np.float32]:
     return np.fromiter(
-        chain.from_iterable([1 / len(dataset)] * len(dataset) for dataset in datasets),
+        chain.from_iterable(
+            [1 / max(1, len(dataset))] * len(dataset) for dataset in datasets
+        ),
         dtype=np.float32,
     )
 
@@ -46,7 +47,7 @@ class BaseDataModule(LightningDataModule):
         datastore: Datastore,
         generator: torch.Generator,
         image_types: list[ImageType],
-        preprocess: transforms.Transform,
+        preprocess: Any,
         lengths: tuple[float, float, float],
         train_batch_size: int,
         eval_batch_size: int,
@@ -60,19 +61,12 @@ class BaseDataModule(LightningDataModule):
         else:
             self.num_workers = 0
 
-        if generator.device.type == "cuda":
-            preprocess = torch.compile(preprocess)
         self.preprocess: Any = preprocess
 
         self.lengths = lengths
 
         self.train_batch_size = train_batch_size
         self.eval_batch_size = eval_batch_size
-
-        if {self.channel_count} != {
-            len(channels_by_image_type[image_type]) for image_type in image_types
-        }:
-            raise ValueError
 
         good_datasets = {
             image_type: ImageDataset(datastore, label="good", suffix=image_type.name)
@@ -203,6 +197,18 @@ class GoodBadDataset(_Dataset[tuple[torch.Tensor, torch.Tensor, torch.Tensor]]):
 
 
 class SliceDataModule(BaseDataModule):
+    @classmethod
+    def get_preprocess(cls, image_size: int) -> Any:
+        return transforms.Compose(
+            [
+                transforms.Resize(None, max_size=image_size),
+                transforms.CenterCrop(size=(image_size, image_size)),
+                transforms.RandomHorizontalFlip(p=0.5),
+                transforms.ElasticTransform(alpha=100.0, sigma=10.0),
+                transforms.ToDtype(torch.float32, scale=True),
+            ]
+        )
+
     def __init__(
         self,
         datastore: Datastore,
@@ -213,20 +219,11 @@ class SliceDataModule(BaseDataModule):
         train_batch_size: int,
         eval_batch_size: int,
     ):
-        preprocess = transforms.Compose(
-            [
-                transforms.Resize(None, max_size=image_size),
-                transforms.CenterCrop(size=(image_size, image_size)),
-                transforms.RandomHorizontalFlip(p=0.5),
-                transforms.ElasticTransform(alpha=100.0, sigma=10.0),
-                transforms.ToDtype(torch.float32, scale=True),
-            ]
-        )
         super().__init__(
             datastore,
             generator,
             image_types,
-            preprocess,
+            self.get_preprocess(image_size),
             lengths,
             train_batch_size,
             eval_batch_size,
@@ -283,43 +280,20 @@ class DataModule2(SliceDataModule):
         )
 
 
-class RandomHorizontalResizedCrop(transforms.Transform):  # type: ignore
-    def __init__(
-        self,
-        size: tuple[int, int],
-        scale: tuple[float, float],
-        interpolation: InterpolationMode = InterpolationMode.BILINEAR,
-        antialias: bool = True,
-    ):
-        super().__init__()
-
-        self.scale = scale
-
-        self.size = size
-        self.interpolation = interpolation
-        self.antialias = antialias
-
-    def _get_params(self, flat_inputs: list[Any]) -> dict[str, Any]:
-        height, width = transforms.query_size(flat_inputs)
-        scale = torch.empty(1).uniform_(self.scale[0], self.scale[1]).item()
-        w = int(round(width * scale))
-        left = int(round(torch.empty(1).uniform_(0, width - w).item()))
-        return dict(top=0, height=height, left=left, width=w)
-
-    def _transform(self, inpt: Any, params: dict[str, float]) -> Any:
-        return self._call_kernel(
-            transforms.functional.resized_crop,
-            inpt,
-            **params,
-            size=self.size,
-            interpolation=self.interpolation,
-            antialias=self.antialias,
-        )
-
-
 class DataModule3(BaseDataModule):
     channel_count = 6
     class_count = 1
+
+    @classmethod
+    def get_preprocess(cls, image_size: int) -> Any:
+        return transforms.Compose(
+            [
+                RandomHorizontalResizedCrop(
+                    size=(image_size, image_size), scale=(0.3, 1.0)
+                ),
+                transforms.ToDtype(torch.float32, scale=True),
+            ]
+        )
 
     def __init__(
         self,
@@ -330,20 +304,12 @@ class DataModule3(BaseDataModule):
         train_batch_size: int,
         eval_batch_size: int,
     ):
-        preprocess = transforms.Compose(
-            [
-                RandomHorizontalResizedCrop(
-                    size=(image_size, image_size), scale=(0.3, 1.0)
-                ),
-                transforms.ToDtype(torch.float32, scale=True),
-            ]
-        )
         image_types = [ImageType.bold_conf]
         super().__init__(
             datastore,
             generator,
             image_types,
-            preprocess,
+            self.get_preprocess(image_size),
             lengths,
             train_batch_size,
             eval_batch_size,
@@ -351,3 +317,54 @@ class DataModule3(BaseDataModule):
 
 
 DataModule: TypeAlias = DataModule1 | DataModule2 | DataModule3
+
+
+class TwoChannelDataModule(BaseDataModule):
+    channel_count = 2
+    class_count = 21 + 21 + 21 + 1 + 21
+
+    def __init__(
+        self,
+        datastore: Datastore,
+        generator: torch.Generator,
+        lengths: tuple[float, float, float],
+        image_size: int,
+        train_batch_size: int,
+        eval_batch_size: int,
+    ):
+        self.preprocess_slice = SliceDataModule.get_preprocess(image_size)
+        self.preprocess_bold_conf = DataModule3.get_preprocess(image_size)
+        image_types = [
+            ImageType.skull_strip_report,
+            ImageType.t1_norm_rpt,
+            ImageType.tsnr_rpt,
+            ImageType.bold_conf,
+            ImageType.epi_norm_rpt,
+        ]
+        super().__init__(
+            datastore,
+            generator,
+            image_types,
+            self.preprocess,
+            lengths,
+            train_batch_size,
+            eval_batch_size,
+        )
+
+    def preprocess(self, tensor: torch.Tensor) -> Any:
+        channel_count = tensor.shape[-3]  # shape is ..., channel_count, height, width
+        if channel_count == 2:
+            return self.preprocess_slice(tensor)
+        elif channel_count == 6:
+            return self.preprocess_bold_conf(tensor[(0, -1), ...])
+        elif channel_count == 12:
+            weights = torch.tensor(
+                [170, 43, 212, 128, 149, 234, 234, 191, 128, 212, 255],
+                dtype=torch.uint8,
+            )
+            merge, _ = (tensor[1:-1] * weights[:-1, np.newaxis, np.newaxis]).max(dim=0)
+            merge[torch.logical_and(merge == 0, tensor[-1] != 0)] = weights[-1]
+            tensor = torch.cat([tensor[np.newaxis, 0, ...], merge[np.newaxis, ...]])
+            return self.preprocess_slice(tensor)
+        else:
+            raise ValueError

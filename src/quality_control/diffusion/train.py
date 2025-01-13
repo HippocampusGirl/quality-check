@@ -8,7 +8,13 @@ from typing import Any, Type
 import optuna
 import torch
 from accelerate import Accelerator
-from accelerate.utils import TorchDynamoPlugin
+from accelerate.utils import (
+    DDPCommunicationHookType,
+    DistributedDataParallelKwargs,
+    FP8RecipeKwargs,
+    FullyShardedDataParallelPlugin,
+    TorchDynamoPlugin,
+)
 from diffusers import DDPMScheduler
 from optuna.artifacts import FileSystemArtifactStore, download_artifact, upload_artifact
 from optuna.storages import RetryFailedTrialCallback
@@ -20,7 +26,7 @@ from ..data.datamodule import DataModule
 from ..data.schema import Datastore
 from ..logging import logger
 from .evaluate import evaluate
-from .unet import get_learning_rate_scheduler, get_model, get_optimizer
+from .model import get_learning_rate_scheduler, get_model, get_optimizer
 
 
 @dataclass
@@ -40,6 +46,8 @@ def epoch(
     timestep_count: int,
 ) -> None:
     device = model.device
+    model = model.train()
+
     noise_scheduler = DDPMScheduler(num_train_timesteps=timestep_count)
     with tqdm(total=len(train_dataloader), leave=False) as progress_bar:
         progress_bar.set_description(f"Epoch {state.epoch_index + 1}")
@@ -75,8 +83,8 @@ def epoch(
                 learning_rate_scheduler.step()
                 optimizer.zero_grad(set_to_none=True)
 
-            # if step_index == 0:  # Reset timers
-            #     progress_bar.start_t = progress_bar._time()
+            if state.step_index == 0:  # Reset timers to account for jit compilation
+                progress_bar.start_t = progress_bar._time()
 
             progress_bar.update(1)
             logs = {
@@ -87,10 +95,10 @@ def epoch(
             progress_bar.set_postfix(**logs)
             state.step_index += 1
 
-            # rate = progress_bar.format_dict["rate"]
-            # remaining = (progress_bar.total - progress_bar.n) / rate
-            # if remaining > 3600 and step_index > 2:
-            #     raise torch.OutOfMemoryError  # Too slow
+            rate = progress_bar.format_dict["rate"]
+            remaining = (progress_bar.total - progress_bar.n) / rate
+            if remaining > 10000 and state.step_index > 10:
+                raise RuntimeError("Too slow")
 
 
 @dataclass
@@ -105,28 +113,48 @@ class Trainer:
 
     seed: int
 
-    timestep_count: int
     epoch_count: int
 
+    timestep_count: int = 1000
     accelerator: Accelerator = field(init=False)
 
     def __post_init__(self) -> None:
+        fullgraph = True
         if torch.cuda.get_device_capability() >= (8, 0):
             mixed_precision = "bf16"
         else:
             mixed_precision = "fp16"
         # mixed_precision = "fp8"
-        # fp8_recipe_kwargs = FP8RecipeKwargs(backend="msamp", opt_level="02")
+        kwargs_handlers: list[Any] = list()
+        if mixed_precision == "fp8":
+            fullgraph = False
+            fp8_recipe_kwargs = FP8RecipeKwargs(backend="te", fp8_format="HYBRID")
+            kwargs_handlers.append(fp8_recipe_kwargs)
+        fsdp_plugin: FullyShardedDataParallelPlugin | None = None
+        # deepspeed_plugin: DeepSpeedPlugin
+
+        cuda_device_count = torch.cuda.device_count()
+        logger.info(f"{torch.cuda.device_count()=}")
+        if cuda_device_count > 1:
+            # fsdp_plugin = FullyShardedDataParallelPlugin(sharding_strategy="FULL_SHARD")
+            kwargs_handlers.append(
+                DistributedDataParallelKwargs(
+                    comm_hook=DDPCommunicationHookType[mixed_precision.upper()]
+                )
+            )
         self.accelerator = Accelerator(
             mixed_precision=mixed_precision,
             gradient_accumulation_steps=self.gradient_accumulation_steps,
             dynamo_plugin=TorchDynamoPlugin(
-                backend="inductor", fullgraph=True, mode="reduce-overhead"
+                backend="inductor",
+                fullgraph=fullgraph,  # , mode="reduce-overhead"
             ),
-            # kwargs_handlers=[fp8_recipe_kwargs],
+            fsdp_plugin=fsdp_plugin,
+            kwargs_handlers=kwargs_handlers,
         )
 
         torch._dynamo.config.cache_size_limit = 64
+        torch.set_float32_matmul_precision("high")
 
         device = self.accelerator.device
         logger.info(f"{device=}")
@@ -170,15 +198,13 @@ class Trainer:
             state.epoch_index += 1
 
             logger.info(
-                f"Resuming model {model} from trial {retry_trial_number} "
-                f"in epoch {state.epoch_index}"
+                f"Resuming from trial {retry_trial_number} in epoch {state.epoch_index}"
             )
 
             model.load_state_dict(checkpoint["model_state_dict"])
             optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
             r2 = checkpoint["r2"]
         else:
-            logger.info(f"Training model {model}")
             state = TrainingState()
 
         for epoch_index in range(state.epoch_index, self.epoch_count):
@@ -237,6 +263,9 @@ class Trainer:
         parameter_count = model.num_parameters()
         memory_footprint: float = model.get_memory_footprint(return_buffers=True) / 1e9
         logger.info(f"{memory_footprint=} {parameter_count=}")
+        if memory_footprint > 1:
+            trial.set_user_attr("constraint", (0.0, 1.0, 0.0))
+            return -1.0
         # with torch.device(self.device):
         optimizer = get_optimizer(trial, model)
 
@@ -281,9 +310,17 @@ class Trainer:
     def objective(self, trial: optuna.trial.Trial) -> float:
         try:
             r2 = self._objective(trial)
-        except (torch.OutOfMemoryError, RuntimeError) as e:
-            logger.info("Out of memory", exc_info=e, stack_info=False)
-            trial.set_user_attr("constraint", (1,))
+        except torch.OutOfMemoryError as e:
+            logger.info(
+                "Marking trial as constrained after error", exc_info=e, stack_info=False
+            )
+            trial.set_user_attr("constraint", (0.0, 0.0, 1.0))
+            return -1.0
+        except RuntimeError as e:
+            logger.info(
+                "Marking trial as constrained after error", exc_info=e, stack_info=False
+            )
+            trial.set_user_attr("constraint", (1.0, 0.0, 0.0))
             return -1.0
         except KeyboardInterrupt:
             # Exit immediately without letting optuna mark the trial as failed

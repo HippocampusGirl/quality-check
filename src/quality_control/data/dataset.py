@@ -1,12 +1,15 @@
+import pickle
 from dataclasses import dataclass
 from enum import IntEnum, auto
 from operator import attrgetter
+from pathlib import Path
 
 import numpy as np
 from numpy import typing as npt
 from torch.utils.data import Dataset as _Dataset
 from tqdm.auto import tqdm
 
+from ..utils import hex_digest
 from .compression import decompress_image
 from .schema import Datastore
 
@@ -91,27 +94,52 @@ def get_channels(image_type: ImageType) -> npt.NDArray[np.uint8]:
 
 
 class ImageDataset(_Dataset[Image]):
+    query: frozenset[tuple[str, str]]
+    images: list[tuple[ImageType, npt.NDArray[np.uint8], int]]
+
     def __init__(self, datastore: Datastore, **query_dict: str):
         self.datastore = datastore
-        self.images: list[tuple[ImageType, npt.NDArray[np.uint8], int]] = list()
-
         self.query = frozenset(query_dict.items())
 
         with self.datastore:
-            image_ids_by_tags = datastore.get_image_ids_by_tags()
-            for tags_set, image_ids in tqdm(image_ids_by_tags.items(), leave=False):
-                if not self.query.issubset(tags_set):
-                    continue
-                tags = dict(tags_set)
-                image_type = ImageType[tags["suffix"]]
-                for image_id in image_ids:
-                    direction_str, index = datastore.get_direction_and_index(image_id)
-                    position = np.zeros(3, dtype=np.uint8)
-                    if direction_str is not None and index is not None:
-                        if index == 0:
-                            raise ValueError
-                        position[["x", "y", "z"].index(direction_str)] = index
-                    self.images.append((image_type, position, image_id))
+            cache_path: Path | None = None
+            if datastore.cache_path is not None:
+                cache_path = (
+                    datastore.cache_path
+                    / f"image-dataset-{hex_digest(query_dict)}.pickle"
+                )
+                if cache_path.is_file():
+                    with cache_path.open("rb") as file_handle:
+                        self.images = pickle.load(file_handle)
+                        return
+
+            self.images = self.get_images(datastore)
+
+            if cache_path is not None:
+                with cache_path.open("wb") as file_handle:
+                    pickle.dump(self.images, file_handle)
+
+    def get_images(
+        self, datastore: Datastore
+    ) -> list[tuple[ImageType, npt.NDArray[np.uint8], int]]:
+        images: list[tuple[ImageType, npt.NDArray[np.uint8], int]] = list()
+        image_ids_by_tags = datastore.get_image_ids_by_tags()
+        for tags_set, image_ids in tqdm(
+            image_ids_by_tags.items(), leave=False, unit="images" + " "
+        ):
+            if not self.query.issubset(tags_set):
+                continue
+            tags = dict(tags_set)
+            image_type = ImageType[tags["suffix"]]
+            for image_id in image_ids:
+                direction_str, index = datastore.get_direction_and_index(image_id)
+                position = np.zeros(3, dtype=np.uint8)
+                if direction_str is not None and index is not None:
+                    if index == 0:
+                        raise ValueError
+                    position[["x", "y", "z"].index(direction_str)] = index
+                images.append((image_type, position, image_id))
+        return images
 
     def __len__(self) -> int:
         return len(self.images)

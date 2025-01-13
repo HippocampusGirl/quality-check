@@ -13,18 +13,11 @@ def parse_arguments(argv: list[str]) -> Namespace:
     argument_parser.add_argument("--datastore-database-uri", type=str, required=True)
     argument_parser.add_argument("--data-module", type=str, required=True)
 
-    argument_parser.add_argument("--optuna-database-uri", type=str, required=True)
-    argument_parser.add_argument(
-        "--optuna-artifact-store-path", type=Path, required=True
-    )
-    argument_parser.add_argument("--optuna-study-name", type=str, required=True)
-    argument_parser.add_argument("--trial-count", type=int, default=100)
+    argument_parser.add_argument("--artifact-store-path", type=Path, required=True)
 
     argument_parser.add_argument("--epoch-count", type=int, default=50)
-    argument_parser.add_argument("--train-batch-size", type=int, default=16)
+    argument_parser.add_argument("--batch-size", type=int, default=16)
     argument_parser.add_argument("--gradient-accumulation-steps", type=int, default=1)
-    argument_parser.add_argument("--eval-batch-size", type=int, default=16)
-    argument_parser.add_argument("--timestep-count", type=int, default=1000)
     argument_parser.add_argument("--seed", type=int, default=0)
 
     argument_parser.add_argument("--debug", action="store_true", default=False)
@@ -56,11 +49,10 @@ def run_train(
     try:
         from ..data.schema import Datastore
 
-        datastore = Datastore(database_uri=arguments.datastore_database_uri)
-
-        from optuna.artifacts import FileSystemArtifactStore
-
-        artifact_store = FileSystemArtifactStore(arguments.optuna_artifact_store_path)
+        datastore = Datastore(
+            database_uri=arguments.datastore_database_uri,
+            cache_path=arguments.artifact_store_path,
+        )
 
         from ..data import datamodule
         from .train import Trainer
@@ -69,42 +61,15 @@ def run_train(
 
         trainer = Trainer(
             datastore=datastore,
-            artifact_store=artifact_store,
             data_module_class=data_module_class,
-            train_batch_size=arguments.train_batch_size,
+            train_batch_size=arguments.batch_size,
             gradient_accumulation_steps=arguments.gradient_accumulation_steps,
-            eval_batch_size=arguments.eval_batch_size,
-            timestep_count=arguments.timestep_count,
+            eval_batch_size=arguments.batch_size,
             seed=arguments.seed,
             epoch_count=arguments.epoch_count,
         )
 
-        import optuna
-        from optuna.storages import RetryFailedTrialCallback
-
-        sampler = optuna.samplers.TPESampler(seed=arguments.seed)
-        pruner = optuna.pruners.HyperbandPruner()
-        storage = optuna.storages.RDBStorage(
-            arguments.optuna_database_uri,
-            heartbeat_interval=1,
-            grace_period=120,
-            failed_trial_callback=RetryFailedTrialCallback(
-                inherit_intermediate_values=True
-            ),
-        )
-        study = optuna.create_study(
-            direction="maximize",
-            sampler=sampler,
-            pruner=pruner,
-            study_name=arguments.optuna_study_name,
-            storage=storage,
-            load_if_exists=True,
-        )
-        study.optimize(
-            trainer.objective,
-            n_trials=arguments.trial_count,
-            gc_after_trial=True,
-        )
+        trainer.objective()
     except Exception as e:
         logger.exception("Exception: %s", e, exc_info=True)
         if arguments.debug:
@@ -113,3 +78,7 @@ def run_train(
             pdb.post_mortem()
         if error_action == "raise":
             raise e
+
+
+if __name__ == "__main__":
+    train()
