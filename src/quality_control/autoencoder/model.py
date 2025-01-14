@@ -5,12 +5,14 @@ from ..diffusion.model import get_learning_rate_scheduler as get_learning_rate_s
 from ..diffusion.model import get_optimizer as get_optimizer
 from .discriminator import Discriminator
 
+model_class = VQModel
+
 
 def get_model(channel_count: int) -> torch.nn.Module:
     # https://github.com/huggingface/diffusers/blob/main/examples/vqgan/train_vqgan.py#L603
     # Taken from config of movq at kandinsky-community/kandinsky-2-2-decoder but without
     # the attention layers
-    model = VQModel(
+    model = model_class(
         in_channels=channel_count,
         out_channels=channel_count,
         down_block_types=[

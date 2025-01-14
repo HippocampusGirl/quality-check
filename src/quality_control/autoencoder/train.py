@@ -1,10 +1,14 @@
 import os
 from dataclasses import dataclass, field
-from typing import Any, Type
+from functools import partial
+from pathlib import Path
+from time import time_ns
+from typing import Any, Callable, Iterator, Type
 
 import bitsandbytes
 import torch
 from accelerate import Accelerator
+from accelerate.tracking import TensorBoardTracker
 from accelerate.utils import (
     DDPCommunicationHookType,
     DistributedDataParallelKwargs,
@@ -18,19 +22,15 @@ from tqdm.auto import tqdm
 from ..data.datamodule import DataModule
 from ..data.schema import Datastore
 from ..logging import logger
-from ..utils import Timer
-from .evaluate import evaluate
+from ..utils import Timer, TrainingState
+from .discriminator import Discriminator
 from .model import (
     get_discriminator_model,
     get_learning_rate_scheduler,
     get_model,
+    model_class,
 )
-
-
-@dataclass
-class TrainingState:
-    epoch_index: int = 0
-    step_index: int = 0
+from .validate import validate
 
 
 @dataclass
@@ -60,6 +60,10 @@ def epoch(
     autoencoder: Model,
     discriminator: Model,
     train_dataloader: DataLoader[tuple[torch.Tensor, torch.Tensor]],
+    checkpoint: Callable[[TrainingState], None],
+    checkpoint_steps: int,
+    validate: Callable[..., None],
+    val_steps: int,
 ) -> None:
     autoencoder.model = autoencoder.model.train()
     discriminator.model = discriminator.model.train()
@@ -70,9 +74,19 @@ def epoch(
     data_timer.start()
 
     reconstructed_images: torch.Tensor | None = None
-    with tqdm(total=len(train_dataloader), leave=False) as progress_bar:
+    average_autoencoder_loss: torch.Tensor | None = None
+    average_discriminator_loss: torch.Tensor | None = None
+    with tqdm(
+        total=len(train_dataloader),
+        leave=False,
+        disable=not accelerator.is_main_process,
+        unit="steps" + " ",
+        position=0,
+    ) as progress_bar:
         progress_bar.set_description(f"Epoch {state.epoch_index + 1}")
         for images, _ in train_dataloader:
+            batch_size = images.size(0)
+
             data_timer.stop()
             model_timer.start()
 
@@ -88,6 +102,10 @@ def epoch(
                         raise ValueError
                     loss = mse_loss(images, reconstructed_images)
                     loss += commit_loss
+
+                    average_autoencoder_loss = accelerator.gather(
+                        loss.repeat(batch_size)
+                    ).mean()
 
                     accelerator.backward(loss)
                     accelerator.clip_grad_norm_(autoencoder.model.parameters(), 1.0)
@@ -108,6 +126,10 @@ def epoch(
                     ).mean()
                     # loss += gradient_penalty(images, real)
 
+                    average_discriminator_loss = accelerator.gather(
+                        loss.repeat(batch_size)
+                    ).mean()
+
                     accelerator.backward(loss)
                     accelerator.clip_grad_norm_(discriminator.model.parameters(), 1.0)
                     discriminator.optimizer.step()
@@ -117,14 +139,31 @@ def epoch(
             model_timer.stop()
 
             progress_bar.update(1)
-            logs = {
-                "loss": loss.detach().item(),
-                "learning_rate": autoencoder.learning_rate_scheduler.get_last_lr()[0],
-                "step": state.step_index,
-                "data_time": data_timer.value,
-                "model_time": model_timer.value,
-            }
-            progress_bar.set_postfix(**logs)
+            if (
+                accelerator.sync_gradients
+                and accelerator.is_main_process
+                and state.step_index != 0
+            ):
+                learning_rate = autoencoder.learning_rate_scheduler.get_last_lr()[0]
+                logs = dict(
+                    learning_rate=learning_rate,
+                    epoch=state.epoch_index,
+                    data_time=data_timer.value,
+                    model_time=model_timer.value,
+                )
+                progress_bar.set_postfix(**logs)
+                if average_autoencoder_loss is not None:
+                    logs["autoencoder_train_loss"] = average_autoencoder_loss.item()
+                    average_autoencoder_loss = None
+                if average_discriminator_loss is not None:
+                    logs["discriminator_train_loss"] = average_discriminator_loss.item()
+                    average_discriminator_loss = None
+                accelerator.log(logs, step=state.step_index)
+
+                if state.step_index % checkpoint_steps == 0:
+                    checkpoint(state)
+            if state.step_index % val_steps == 0:
+                validate(state=state, model=autoencoder.model)
             state.step_index += 1
 
             data_timer.start()
@@ -134,18 +173,28 @@ def epoch(
 class Trainer:
     datastore: Datastore
     data_module_class: Type[DataModule]
-
-    train_batch_size: int
-    gradient_accumulation_steps: int
-    eval_batch_size: int
-
     seed: int
 
+    batch_size: int
+    gradient_accumulation_steps: int
     epoch_count: int
 
+    val_steps: int = 100
+    val_count: int = 50
+    checkpoint_steps: int = 500
+
+    artifact_path: Path = field(init=False)
     accelerator: Accelerator = field(init=False)
+    checkpoint_prefix: str = field(init=False)
 
     def __post_init__(self) -> None:
+        if self.datastore.cache_path is None:
+            raise ValueError("Datastore cache path is None")
+        self.checkpoint_prefix = (
+            f"dataset-{self.datastore.name}_model-autoencoder_step-"
+        )
+        self.artifact_path = self.datastore.cache_path
+
         fullgraph = True
         mixed_precision = "bf16"
         kwargs_handlers: list[Any] = list()
@@ -167,6 +216,10 @@ class Trainer:
                     comm_hook=DDPCommunicationHookType[mixed_precision.upper()]
                 )
             )
+
+        tensorboard_path = self.artifact_path / "tensorboard"
+        tensorboard_path.mkdir(parents=True, exist_ok=True)
+
         self.accelerator = Accelerator(
             mixed_precision=mixed_precision,
             gradient_accumulation_steps=self.gradient_accumulation_steps,
@@ -176,88 +229,77 @@ class Trainer:
             ),
             fsdp_plugin=fsdp_plugin,
             kwargs_handlers=kwargs_handlers,
+            log_with=TensorBoardTracker(
+                run_name=str(time_ns()), logging_dir=tensorboard_path
+            ),
         )
 
-        torch._dynamo.config.cache_size_limit = 64
+        torch._dynamo.config.cache_size_limit = 1 << 10
         torch.set_float32_matmul_precision("high")
 
         logger.info(f"{self.accelerator.is_main_process=}")
         logger.info(f"{torch.cuda.get_device_properties(self.accelerator.device)=}")
 
-    def train_autoencoder(
+        if self.accelerator.is_main_process:
+            self.accelerator.init_trackers(self.datastore.name)
+
+    def checkpoint(self, state: TrainingState) -> None:
+        state_path = self.artifact_path / f"{self.checkpoint_prefix}{state.step_index}"
+        self.accelerator.save_state(state_path)
+
+    def train(
         self,
         # trial: optuna.trial.Trial,
         autoencoder: Model,
         discriminator: Model,
         train_dataloader: DataLoader[tuple[torch.Tensor, torch.Tensor]],
         val_dataloader: DataLoader[tuple[torch.Tensor, torch.Tensor, torch.Tensor]],
-    ) -> float:
-        loss = float("inf")
-
-        # study = trial.study
-        # artifact_id = None
-        # retry_history = RetryFailedTrialCallback.retry_history(trial)  # type: ignore
-        # for trial_number in reversed(retry_history):
-        #     artifact_id = study.trials[trial_number].user_attrs.get("artifact_id")
-        #     if artifact_id is not None:
-        #         retry_trial_number = trial_number
-        #         break
-
-        # if artifact_id is not None:
-        #     with TemporaryDirectory() as temporary_directory_str:
-        #         path = Path(temporary_directory_str) / "model.pt"
-        #         download_artifact(
-        #             artifact_store=self.artifact_store,
-        #             file_path=str(path),
-        #             artifact_id=artifact_id,
-        #         )
-        #         checkpoint = torch.load(path, weights_only=True)
-        #     state = TrainingState(**checkpoint["training_state_dict"])
-        #     state.epoch_index += 1
-
-        #     logger.info(
-        #         f"Resuming from trial {retry_trial_number} in epoch
-        # {state.epoch_index}"
-        #     )
-
-        #     autoencoder.load_state_dict(checkpoint["autoencoder"])
-        #     discriminator.load_state_dict(checkpoint["discriminator"])
-        #     loss = checkpoint["loss"]
-        # else:
+    ) -> None:
         state = TrainingState()
+        self.accelerator.register_for_checkpointing(state)
 
-        for epoch_index in range(state.epoch_index, self.epoch_count):
+        checkpoints = list(self.artifact_path.glob(f"{self.checkpoint_prefix}*"))
+        checkpoints.sort(
+            key=lambda path: int(path.stem.removeprefix(self.checkpoint_prefix)),
+        )
+        latest_checkpoint = checkpoints[-1] if checkpoints else None
+
+        if latest_checkpoint is not None:
+            self.accelerator.load_state(latest_checkpoint)
+            logger.info(f"Resuming from {state}")
+
+        def val_iterator() -> Iterator[tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
+            while True:
+                yield from val_dataloader
+
+        for epoch_index in range(
+            state.epoch_index, state.epoch_index + self.epoch_count
+        ):
             state.epoch_index = epoch_index
 
             epoch(
-                state,
-                self.accelerator,
-                autoencoder,
-                discriminator,
-                train_dataloader,
+                state=state,
+                accelerator=self.accelerator,
+                autoencoder=autoencoder,
+                discriminator=discriminator,
+                train_dataloader=train_dataloader,
+                checkpoint=self.checkpoint,
+                checkpoint_steps=self.checkpoint_steps,
+                validate=partial(
+                    validate,
+                    accelerator=self.accelerator,
+                    val_iterator=val_iterator(),
+                    val_count=self.val_count,
+                ),
+                val_steps=self.val_steps,
             )
 
-            if (
-                self.accelerator.is_main_process
-                and self.datastore.cache_path is not None
-            ):
-                self.accelerator.save_state(
-                    self.datastore.cache_path
-                    / f"model-autoencoder_epoch-{state.epoch_index}.pt"
-                )
+            self.accelerator.wait_for_everyone()
+            self.checkpoint(state)
 
-            loss = evaluate(
-                autoencoder.model,
-                val_dataloader,
-                step_count=50,
-                step_pruning=5,
-            )
-            # trial.report(loss, state.step_index)
-            logger.info(f"Reported {loss=} at {state.step_index=}")
+        self.accelerator.end_training()
 
-        return loss
-
-    def objective(self) -> float:
+    def run(self) -> None:
         channel_count = self.data_module_class.channel_count
         autoencoder_model = get_model(channel_count)
         autoencoder_optimizer = bitsandbytes.optim.AdamW8bit(
@@ -268,13 +310,51 @@ class Trainer:
             discriminator_model.parameters(), lr=1e-4
         )
 
+        def save_model_hook(
+            models: list[torch.nn.Module], weights: list[Any], output_dir: Path | str
+        ) -> None:
+            output_path = Path(output_dir)
+            if self.accelerator.is_main_process:
+                autoencoder_model, discriminator_model = models
+                autoencoder_model.save_pretrained(output_path / "autoencoder")
+                discriminator_model.save_pretrained(output_path / "discriminator")
+                weights.pop()
+                weights.pop()
+
+        def load_model_hook(
+            models: list[torch.nn.Module], input_dir: Path | str
+        ) -> None:
+            input_path = Path(input_dir)
+            discriminator_model = models.pop()
+            pretrained_discriminator_model = Discriminator.from_pretrained(
+                input_path, subfolder="discriminator"
+            )
+            discriminator_model.register_to_config(
+                **pretrained_discriminator_model.config
+            )
+            discriminator_model.load_state_dict(
+                pretrained_discriminator_model.state_dict()
+            )
+            del pretrained_discriminator_model
+
+            autoencoder_model = models.pop()
+            pretrained_autoencoder_model = model_class.from_pretrained(
+                input_path, subfolder="autoencoder"
+            )
+            autoencoder_model.register_to_config(**pretrained_autoencoder_model.config)
+            autoencoder_model.load_state_dict(pretrained_autoencoder_model.state_dict())
+            del pretrained_autoencoder_model
+
+        self.accelerator.register_save_state_pre_hook(save_model_hook)
+        self.accelerator.register_load_state_pre_hook(load_model_hook)
+
         data_module = self.data_module_class(
             self.datastore,
             generator=torch.Generator(device="cpu").manual_seed(self.seed),
             lengths=(0.8, 0.15, 0.05),
             image_size=512,
-            train_batch_size=self.train_batch_size,
-            eval_batch_size=self.eval_batch_size,
+            train_batch_size=self.batch_size,
+            eval_batch_size=self.batch_size,
         )
         train_dataloader = data_module.train_dataloader()
         val_dataloader = data_module.val_dataloader()
@@ -314,7 +394,7 @@ class Trainer:
             val_dataloader,
         )
 
-        return self.train_autoencoder(
+        self.train(
             autoencoder,
             discriminator,
             train_dataloader,

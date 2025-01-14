@@ -1,5 +1,5 @@
-from dataclasses import dataclass
 import json
+from dataclasses import dataclass
 from functools import cache
 from hashlib import sha1
 from subprocess import check_output
@@ -40,3 +40,19 @@ class Timer:
             return self.numerator / self.denominator
         else:
             return float("nan")
+
+
+@dataclass
+class TrainingState:
+    epoch_index: int = 0
+    step_index: int = 0
+
+    def state_dict(self) -> dict[str, Any]:
+        return {
+            "epoch_index": self.epoch_index,
+            "step_index": self.step_index,
+        }
+
+    def load_state_dict(self, state_dict: dict[str, Any]) -> None:
+        self.epoch_index = state_dict["epoch_index"]
+        self.step_index = state_dict["step_index"]

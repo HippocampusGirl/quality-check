@@ -3,13 +3,13 @@ from dataclasses import dataclass
 from enum import IntEnum, auto
 from operator import attrgetter
 from pathlib import Path
+from typing import TypeAlias
 
 import numpy as np
 from numpy import typing as npt
 from torch.utils.data import Dataset as _Dataset
 from tqdm.auto import tqdm
 
-from ..utils import hex_digest
 from .compression import decompress_image
 from .schema import Datastore
 
@@ -87,6 +87,9 @@ class Image:
     data: npt.NDArray[np.uint8]
 
 
+ImageTuple: TypeAlias = tuple[str, str, ImageType, npt.NDArray[np.uint8], int]
+
+
 def get_channels(image_type: ImageType) -> npt.NDArray[np.uint8]:
     return np.fromiter(
         map(attrgetter("value"), channels_by_image_type[image_type]), dtype=np.uint8
@@ -95,18 +98,19 @@ def get_channels(image_type: ImageType) -> npt.NDArray[np.uint8]:
 
 class ImageDataset(_Dataset[Image]):
     query: frozenset[tuple[str, str]]
-    images: list[tuple[ImageType, npt.NDArray[np.uint8], int]]
+    images: list[ImageTuple]
 
     def __init__(self, datastore: Datastore, **query_dict: str):
         self.datastore = datastore
         self.query = frozenset(query_dict.items())
+        query_str = "_".join(map("-".join, self.query))
 
         with self.datastore:
             cache_path: Path | None = None
             if datastore.cache_path is not None:
                 cache_path = (
                     datastore.cache_path
-                    / f"image-dataset-{hex_digest(query_dict)}.pickle"
+                    / f"dataset-{datastore.name}_{query_str}.pickle"
                 )
                 if cache_path.is_file():
                     with cache_path.open("rb") as file_handle:
@@ -119,10 +123,8 @@ class ImageDataset(_Dataset[Image]):
                 with cache_path.open("wb") as file_handle:
                     pickle.dump(self.images, file_handle)
 
-    def get_images(
-        self, datastore: Datastore
-    ) -> list[tuple[ImageType, npt.NDArray[np.uint8], int]]:
-        images: list[tuple[ImageType, npt.NDArray[np.uint8], int]] = list()
+    def get_images(self, datastore: Datastore) -> list[ImageTuple]:
+        images: list[ImageTuple] = list()
         image_ids_by_tags = datastore.get_image_ids_by_tags()
         for tags_set, image_ids in tqdm(
             image_ids_by_tags.items(), leave=False, unit="images" + " "
@@ -138,14 +140,14 @@ class ImageDataset(_Dataset[Image]):
                     if index == 0:
                         raise ValueError
                     position[["x", "y", "z"].index(direction_str)] = index
-                images.append((image_type, position, image_id))
+                images.append((tags["ds"], tags["sub"], image_type, position, image_id))
         return images
 
     def __len__(self) -> int:
         return len(self.images)
 
     def __getitem__(self, index: int) -> Image:
-        image_type, position, image_id = self.images[index]
+        dataset, subject, image_type, position, image_id = self.images[index]
         with self.datastore:
             image_bytes = self.datastore.get_image(image_id)
         channels = get_channels(image_type)

@@ -6,6 +6,7 @@ from itertools import chain
 from pathlib import Path
 from types import TracebackType
 from typing import Iterable, Mapping
+from urllib.parse import urlparse
 
 from file_index.bids import BIDSIndex
 
@@ -20,6 +21,10 @@ class Datastore(AbstractContextManager[None]):
     direction_and_index: dict[int, tuple[str | None, int | None]] = field(
         default_factory=dict
     )
+
+    @property
+    def name(self) -> str:
+        return Path(urlparse(self.database_uri).path).stem
 
     def __enter__(self) -> None:
         self.connection = self.connect()
