@@ -20,7 +20,7 @@ def get_model(channel_count: int) -> torch.nn.Module:
             "DownEncoderBlock2D",
             "DownEncoderBlock2D",
             "DownEncoderBlock2D",
-            "AttnDownEncoderBlock2D",
+            "DownEncoderBlock2D",
         ],
         latent_channels=4,
         layers_per_block=2,
@@ -30,7 +30,7 @@ def get_model(channel_count: int) -> torch.nn.Module:
         sample_size=32,
         scaling_factor=0.18215,
         up_block_types=[
-            "AttnUpDecoderBlock2D",
+            "UpDecoderBlock2D",
             "UpDecoderBlock2D",
             "UpDecoderBlock2D",
             "UpDecoderBlock2D",
