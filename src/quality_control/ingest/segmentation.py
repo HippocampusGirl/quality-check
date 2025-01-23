@@ -192,6 +192,20 @@ def get_paths_from_paths_collection(
         raise ValueError(f'Unexpected tagName "{element.tagName}"')
 
 
+def raster_paths(paths: list[Element], **kwargs: Any) -> npt.NDArray[np.uint8]:
+    layers: list[npt.NDArray[np.bool_]] = list()
+    for path in paths:
+        svg = create_svg_from_elements([path], **kwargs)
+        layers.append((svg_to_raster(svg, **kwargs) != 0).any(axis=2))
+    if layers:
+        xor: npt.NDArray[np.bool_] = np.logical_xor.reduce(np.stack(layers))
+        segmentation_image = xor.astype(np.uint8)
+    else:
+        shape = (kwargs["output_height"], kwargs["output_width"])
+        segmentation_image = np.zeros(shape, dtype=np.uint8)
+    return segmentation_image
+
+
 def parse_segmentation(image_path: str | Path, colors: list[str]) -> Iterator[Report]:
     found_colors: set[str] = set()
     for slice in parse_svg(str(image_path)):
@@ -223,14 +237,12 @@ def parse_segmentation(image_path: str | Path, colors: list[str]) -> Iterator[Re
                 element, inverse_transform
             ):
                 paths_by_color[color].append(path)
-
         segmentation_images: list[npt.NDArray[np.uint8]] = list()
         for color in colors:
             paths = paths_by_color[color]
             if len(paths) > 0:
                 found_colors.add(color)
-            svg = create_svg_from_elements(paths, **kwargs)
-            segmentation_image = (svg_to_raster(svg, **kwargs) != 0).any(axis=2)
+            segmentation_image = raster_paths(paths, **kwargs)
             segmentation_images.append(segmentation_image)
 
         image = np.stack(

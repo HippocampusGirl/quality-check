@@ -7,4 +7,3 @@ logger = logging.getLogger("quality_control")
 logger.setLevel(logging.INFO)
 if _default_handler is None:
     raise RuntimeError
-logger.addHandler(_default_handler)

@@ -5,6 +5,8 @@ from argparse import ArgumentParser, Namespace
 from pathlib import Path
 from typing import Literal
 
+from tqdm.contrib.logging import logging_redirect_tqdm
+
 
 def parse_arguments(argv: list[str]) -> Namespace:
     """Parses command-line arguments"""
@@ -16,11 +18,14 @@ def parse_arguments(argv: list[str]) -> Namespace:
     argument_parser.add_argument("--artifact-store-path", type=Path, required=True)
 
     argument_parser.add_argument("--epoch-count", type=int, default=50)
+    argument_parser.add_argument("--max-step-count", type=int, default=0)
+
     argument_parser.add_argument("--batch-size", type=int, default=16)
     argument_parser.add_argument("--gradient-accumulation-steps", type=int, default=1)
     argument_parser.add_argument("--seed", type=int, default=0)
 
     argument_parser.add_argument("--debug", action="store_true", default=False)
+    argument_parser.add_argument("--profile", action="store_true", default=False)
     argument_parser.add_argument(
         "--log-level", choices=logging.getLevelNamesMapping().keys(), default="INFO"
     )
@@ -30,7 +35,8 @@ def parse_arguments(argv: list[str]) -> Namespace:
 
 
 def train() -> None:
-    run_train(sys.argv[1:])
+    with logging_redirect_tqdm():
+        run_train(sys.argv[1:])
 
 
 def run_train(
@@ -69,6 +75,10 @@ def run_train(
             gradient_accumulation_steps=arguments.gradient_accumulation_steps,
             seed=arguments.seed,
             epoch_count=arguments.epoch_count,
+            max_step_count=arguments.max_step_count
+            if arguments.max_step_count > 0
+            else None,
+            is_profile=arguments.profile,
         )
 
         trainer.run()

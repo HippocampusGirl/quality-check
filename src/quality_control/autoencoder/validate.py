@@ -4,7 +4,8 @@ from typing import Iterator
 
 import torch
 from accelerate import Accelerator
-from torch.nn.functional import mse_loss
+from diffusers.image_processor import VaeImageProcessor
+from torch.nn.functional import l1_loss
 from tqdm.auto import tqdm
 
 from ..logging import logger
@@ -43,9 +44,10 @@ def validate(
             disable=not accelerator.is_main_process,
         ):
             batch_size = images.size(0)
+            images = VaeImageProcessor.normalize(images)
 
             reconstructed_images, _ = model(images, return_dict=False)
-            loss = mse_loss(reconstructed_images, images)
+            loss = l1_loss(reconstructed_images, images)
 
             average_loss: torch.Tensor = accelerator.gather(
                 loss.repeat(batch_size)
@@ -54,27 +56,23 @@ def validate(
             numerator += average_loss.cpu().item()
 
     logs = dict(
-        epoch=state.epoch_index,
+        epoch=state.epoch_index.item(),
         autoencoder_val_loss=numerator / val_count,
     )
 
     if accelerator.is_main_process:
         logger.info(f"Validation {pformat(logs)}")
-        accelerator.log(logs, step=state.step_index)
+        accelerator.log(logs, step=state.step_index.item())
         for tracker in accelerator.trackers:
             if tracker.name == "tensorboard":
                 channels = get_channels(images)
                 reconstructed_channels = get_channels(reconstructed_images)
 
-                tiled = torch.cat(
-                    [channels, reconstructed_channels],
-                    dim=3,
-                )
+                tiled = torch.cat([channels, reconstructed_channels], dim=3)
+                tiled = VaeImageProcessor.denormalize(tiled)
 
                 tracker.log_images(
                     dict(images=tiled),
-                    step=state.step_index,
+                    step=state.step_index.item(),
                     dataformats="NCHW",
                 )
-
-    torch.cuda.empty_cache()

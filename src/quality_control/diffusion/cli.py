@@ -5,6 +5,8 @@ from argparse import ArgumentParser, Namespace
 from pathlib import Path
 from typing import Literal
 
+from tqdm.contrib.logging import logging_redirect_tqdm
+
 
 def parse_arguments(argv: list[str]) -> Namespace:
     """Parses command-line arguments"""
@@ -13,10 +15,12 @@ def parse_arguments(argv: list[str]) -> Namespace:
     argument_parser.add_argument("--datastore-database-uri", type=str, required=True)
     argument_parser.add_argument("--data-module", type=str, required=True)
 
-    argument_parser.add_argument("--optuna-database-uri", type=str, required=True)
+    argument_parser.add_argument("--autoencoder-path", type=Path, required=True)
     argument_parser.add_argument("--artifact-store-path", type=Path, required=True)
+
+    argument_parser.add_argument("--optuna-database-uri", type=str, required=True)
     argument_parser.add_argument("--optuna-study-name", type=str, required=True)
-    argument_parser.add_argument("--trial-count", type=int, default=100)
+    argument_parser.add_argument("--trial-count", type=int, default=50)
 
     argument_parser.add_argument("--epoch-count", type=int, default=50)
     argument_parser.add_argument("--batch-size", type=int, default=16)
@@ -25,6 +29,7 @@ def parse_arguments(argv: list[str]) -> Namespace:
     argument_parser.add_argument("--seed", type=int, default=0)
 
     argument_parser.add_argument("--debug", action="store_true", default=False)
+    argument_parser.add_argument("--profile", action="store_true", default=False)
     argument_parser.add_argument(
         "--log-level", choices=logging.getLevelNamesMapping().keys(), default="INFO"
     )
@@ -34,7 +39,8 @@ def parse_arguments(argv: list[str]) -> Namespace:
 
 
 def train() -> None:
-    run_train(sys.argv[1:])
+    with logging_redirect_tqdm():
+        run_train(sys.argv[1:])
 
 
 def run_train(
@@ -60,23 +66,32 @@ def run_train(
 
         from optuna.artifacts import FileSystemArtifactStore
 
-        artifact_store = FileSystemArtifactStore(arguments.artifact_store_path)
+        optuna_artifact_store_path = arguments.artifact_store_path / "optuna"
+        optuna_artifact_store_path.mkdir(parents=True, exist_ok=True)
+        artifact_store = FileSystemArtifactStore(optuna_artifact_store_path)
 
         from ..data import datamodule
         from .train import Trainer
 
         data_module_class = getattr(datamodule, arguments.data_module)
 
+        from ..autoencoder.model import model_class
+
+        autoencoder_model = model_class.from_pretrained(
+            arguments.autoencoder_path
+        ).eval()
+
         trainer = Trainer(
             datastore=datastore,
-            artifact_store=artifact_store,
             data_module_class=data_module_class,
-            train_batch_size=arguments.batch_size,
+            autoencoder_model=autoencoder_model,
+            artifact_store=artifact_store,
+            batch_size=arguments.batch_size,
             gradient_accumulation_steps=arguments.gradient_accumulation_steps,
-            eval_batch_size=arguments.batch_size,
             timestep_count=arguments.timestep_count,
             seed=arguments.seed,
             epoch_count=arguments.epoch_count,
+            is_profile=arguments.profile,
         )
 
         import optuna
@@ -87,7 +102,7 @@ def run_train(
         storage = optuna.storages.RDBStorage(
             arguments.optuna_database_uri,
             heartbeat_interval=1,
-            grace_period=120,
+            grace_period=10,
             failed_trial_callback=RetryFailedTrialCallback(
                 inherit_intermediate_values=True
             ),

@@ -15,7 +15,7 @@ build-backend = "setuptools.build_meta"
 version_scheme = "no-guess-dev"
 
 [tool.pixi.project]
-channels = ["https://repo.prefix.dev/conda-forge"]
+channels = ["conda-forge"]
 platforms = ["linux-64"]
 
 [tool.pixi.system-requirements]
@@ -47,6 +47,7 @@ zstandard = "*"
 accelerate = "*"
 diffusers = "*"
 safetensors = "*"
+timm = "*"
 transformers = "*"
 
 # pytorch
@@ -67,13 +68,15 @@ libcublas-dev = "*"
 libcusolver-dev = "*"
 libcusparse-dev = "*"
 
-bitsandbytes = "*"
+albumentations = "*"
+bitsandbytes = { version = "*", build = "*cuda*" }
 deepspeed = "*"
 lightning = "*"
-optuna = "*"
+lpips = "*"
+monai = "*"
+optuna = "<4.2"
 optuna-integration = "*"
 tensorboard = "*"
-torchmetrics = "*"
 
 [tool.pixi.feature.development.dependencies]
 jupyterlab = "*"

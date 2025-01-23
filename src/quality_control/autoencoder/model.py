@@ -2,43 +2,47 @@ import torch
 from diffusers import VQModel
 
 from ..diffusion.model import get_learning_rate_scheduler as get_learning_rate_scheduler
-from ..diffusion.model import get_optimizer as get_optimizer
 from .discriminator import Discriminator
 
 model_class = VQModel
 
+image_size: int = 512
+
 
 def get_model(channel_count: int) -> torch.nn.Module:
-    # https://github.com/huggingface/diffusers/blob/main/examples/vqgan/train_vqgan.py#L603
-    # Taken from config of movq at kandinsky-community/kandinsky-2-2-decoder but without
-    # the attention layers
+    # https://github.com/fpsandnoob/vss/blob/main/configs/model/vqvae_512.yaml
     model = model_class(
         in_channels=channel_count,
         out_channels=channel_count,
+        act_fn="silu",
+        block_out_channels=[
+            64,
+            128,
+            256,
+            256,
+            512,
+        ],
         down_block_types=[
             "DownEncoderBlock2D",
             "DownEncoderBlock2D",
             "DownEncoderBlock2D",
+            "DownEncoderBlock2D",
+            "AttnDownEncoderBlock2D",
         ],
-        up_block_types=[
-            "UpDecoderBlock2D",
-            "UpDecoderBlock2D",
-            "UpDecoderBlock2D",
-        ],
-        block_out_channels=[
-            128,
-            256,
-            512,
-        ],
-        layers_per_block=2,
-        act_fn="silu",
         latent_channels=4,
-        sample_size=32,
-        num_vq_embeddings=16384,
+        layers_per_block=2,
         norm_num_groups=32,
-        vq_embed_dim=4,
-        scaling_factor=0.18215,
         norm_type="spatial",
+        num_vq_embeddings=16384,
+        sample_size=32,
+        scaling_factor=0.18215,
+        up_block_types=[
+            "AttnUpDecoderBlock2D",
+            "UpDecoderBlock2D",
+            "UpDecoderBlock2D",
+            "UpDecoderBlock2D",
+            "UpDecoderBlock2D",
+        ],
     )
     return model  # type: ignore
 

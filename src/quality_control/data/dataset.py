@@ -103,7 +103,7 @@ class ImageDataset(_Dataset[Image]):
     def __init__(self, datastore: Datastore, **query_dict: str):
         self.datastore = datastore
         self.query = frozenset(query_dict.items())
-        query_str = "_".join(map("-".join, self.query))
+        query_str = "_".join(map("-".join, query_dict.items()))
 
         with self.datastore:
             cache_path: Path | None = None

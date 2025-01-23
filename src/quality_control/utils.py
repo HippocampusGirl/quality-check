@@ -1,10 +1,18 @@
 import json
+import os
+import signal
+from contextlib import AbstractContextManager
 from dataclasses import dataclass
 from functools import cache
 from hashlib import sha1
 from subprocess import check_output
 from time import time
-from typing import Any
+from types import TracebackType
+from typing import Any, Self, Sequence
+
+import torch
+
+from .logging import logger
 
 
 @cache
@@ -42,17 +50,52 @@ class Timer:
             return float("nan")
 
 
-@dataclass
-class TrainingState:
-    epoch_index: int = 0
-    step_index: int = 0
+class TrainingState(torch.nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.register_buffer("epoch_index", torch.tensor(0))
+        self.register_buffer("step_index", torch.tensor(0))
 
-    def state_dict(self) -> dict[str, Any]:
-        return {
-            "epoch_index": self.epoch_index,
-            "step_index": self.step_index,
-        }
 
-    def load_state_dict(self, state_dict: dict[str, Any]) -> None:
-        self.epoch_index = state_dict["epoch_index"]
-        self.step_index = state_dict["step_index"]
+num_threads_variables: Sequence[str] = [
+    "OMP_NUM_THREADS",
+    "OPENBLAS_NUM_THREADS",
+    "MKL_NUM_THREADS",
+    "VECLIB_MAXIMUM_THREADS",
+    "NUMEXPR_NUM_THREADS",
+    "NUMEXPR_MAX_THREADS",
+    "NPROC",
+    "OPENCV_FFMPEG_THREADS",
+]
+
+
+def apply_num_threads(num_threads: int | None) -> None:
+    for variable in num_threads_variables:
+        os.environ[variable] = str(num_threads)
+
+
+class Timeout(AbstractContextManager["Timeout"]):
+    def __init__(self, seconds: int) -> None:
+        self.seconds = int(seconds)
+        signal.signal(signal.SIGALRM, self.handler)
+
+    def handler(self, *args: Any) -> None:
+        raise TimeoutError()
+
+    def reset(self, seconds: int | None = None) -> None:
+        if seconds is None:
+            seconds = self.seconds
+        signal.alarm(seconds)
+        logger.info(f"Timeout set to {seconds} seconds")
+
+    def __enter__(self) -> Self:
+        self.reset()
+        return self
+
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_value: BaseException | None,
+        traceback: TracebackType | None,
+    ) -> None:
+        signal.alarm(0)

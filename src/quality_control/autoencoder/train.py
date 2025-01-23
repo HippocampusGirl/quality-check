@@ -1,21 +1,24 @@
 import os
+from contextlib import nullcontext
 from dataclasses import dataclass, field
 from functools import partial
+from itertools import islice
 from pathlib import Path
 from time import time_ns
 from typing import Any, Callable, Iterator, Type
 
 import bitsandbytes
 import torch
-from accelerate import Accelerator
+from accelerate.accelerator import Accelerator
 from accelerate.tracking import TensorBoardTracker
 from accelerate.utils import (
     DDPCommunicationHookType,
     DistributedDataParallelKwargs,
     FullyShardedDataParallelPlugin,
+    ProfileKwargs,
     TorchDynamoPlugin,
 )
-from torch.nn.functional import mse_loss
+from diffusers.image_processor import VaeImageProcessor
 from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
 
@@ -23,47 +26,42 @@ from ..data.datamodule import DataModule
 from ..data.schema import Datastore
 from ..logging import logger
 from ..utils import Timer, TrainingState
+from .base import Model
 from .discriminator import Discriminator
+from .loss import LPIPS, AutoencoderLoss, grad
 from .model import (
     get_discriminator_model,
     get_learning_rate_scheduler,
     get_model,
+    image_size,
     model_class,
 )
 from .validate import validate
 
-
-@dataclass
-class Model:
-    model: torch.nn.Module
-    optimizer: torch.optim.Optimizer
-    learning_rate_scheduler: torch.optim.lr_scheduler.LambdaLR
-
-    def state_dict(self) -> dict[str, Any]:
-        return {
-            "model": self.model.state_dict(),
-            "optimizer": self.optimizer.state_dict(),
-            "learning_rate_scheduler": self.learning_rate_scheduler.state_dict(),  # type: ignore
-        }
-
-    def load_state_dict(self, state_dict: dict[str, Any]) -> None:
-        self.model.load_state_dict(state_dict["model"])
-        self.optimizer.load_state_dict(state_dict["optimizer"])
-        self.learning_rate_scheduler.load_state_dict(
-            state_dict["learning_rate_scheduler"]
-        )  # type: ignore
+torch._dynamo.config.cache_size_limit = 1 << 10
+torch.set_float32_matmul_precision("high")
 
 
-def epoch(
+def gradient_penalty(
+    output: torch.Tensor, images: torch.Tensor, weight: float = 10.0
+) -> Any:
+    gradients = grad(output, images)
+    gradients = torch.reshape(gradients, (gradients.size(0), -1))
+    return weight * ((gradients.norm(2, dim=1) - 1) ** 2).mean()
+
+
+def epoch(  # noqa: C901
     state: TrainingState,
     accelerator: Accelerator,
     autoencoder: Model,
+    autoencoder_loss: AutoencoderLoss,
     discriminator: Model,
     train_dataloader: DataLoader[tuple[torch.Tensor, torch.Tensor]],
-    checkpoint: Callable[[TrainingState], None],
+    checkpoint: Callable[[], None],
     checkpoint_steps: int,
-    validate: Callable[..., None],
+    validate: Callable[[], None],
     val_steps: int,
+    max_step_count: int | None = None,
 ) -> None:
     autoencoder.model = autoencoder.model.train()
     discriminator.model = discriminator.model.train()
@@ -76,16 +74,20 @@ def epoch(
     reconstructed_images: torch.Tensor | None = None
     average_autoencoder_loss: torch.Tensor | None = None
     average_discriminator_loss: torch.Tensor | None = None
-    with tqdm(
-        total=len(train_dataloader),
-        leave=False,
-        disable=not accelerator.is_main_process,
-        unit="steps" + " ",
-        position=0,
-    ) as progress_bar:
-        progress_bar.set_description(f"Epoch {state.epoch_index + 1}")
-        for images, _ in train_dataloader:
+    with (
+        tqdm(
+            total=len(train_dataloader),
+            leave=False,
+            disable=not accelerator.is_main_process,
+            unit="steps" + " ",
+            position=0,
+        ) as progress_bar,
+        accelerator.profile() as profile,
+    ):
+        progress_bar.set_description(f"Epoch {state.epoch_index.item() + 1}")
+        for images, _ in islice(train_dataloader, max_step_count):
             batch_size = images.size(0)
+            images = VaeImageProcessor.normalize(images)
 
             data_timer.stop()
             model_timer.start()
@@ -100,14 +102,19 @@ def epoch(
                     )
                     if reconstructed_images is None:
                         raise ValueError
-                    loss = mse_loss(images, reconstructed_images)
+
+                    loss = autoencoder_loss(images, reconstructed_images)
                     loss += commit_loss
 
                     average_autoencoder_loss = accelerator.gather(
                         loss.repeat(batch_size)
                     ).mean()
 
+                    # with torch._dynamo.compiled_autograd.enable(
+                    #     torch.compile(**accelerator.state.dynamo_plugin.to_kwargs())
+                    # ):
                     accelerator.backward(loss)
+
                     accelerator.clip_grad_norm_(autoencoder.model.parameters(), 1.0)
                     autoencoder.optimizer.step()
                     autoencoder.learning_rate_scheduler.step()
@@ -115,16 +122,16 @@ def epoch(
             else:
                 with accelerator.accumulate(discriminator.model):
                     reconstructed_images = reconstructed_images.detach_()
-                    reconstructed = discriminator.model(reconstructed_images)
+                    reconstructed_score = discriminator.model(reconstructed_images)
 
                     images = images.requires_grad_()
-                    real = discriminator.model(images)
+                    score = discriminator.model(images)
 
                     loss = (
-                        torch.nn.functional.relu(1 + reconstructed)
-                        + torch.nn.functional.relu(1 - real)
+                        torch.nn.functional.relu(1 + reconstructed_score)
+                        + torch.nn.functional.relu(1 - score)
                     ).mean()
-                    # loss += gradient_penalty(images, real)
+                    loss += gradient_penalty(score, images)
 
                     average_discriminator_loss = accelerator.gather(
                         loss.repeat(batch_size)
@@ -139,32 +146,34 @@ def epoch(
             model_timer.stop()
 
             progress_bar.update(1)
-            if (
-                accelerator.sync_gradients
-                and accelerator.is_main_process
-                and state.step_index != 0
-            ):
-                learning_rate = autoencoder.learning_rate_scheduler.get_last_lr()[0]
-                logs = dict(
-                    learning_rate=learning_rate,
-                    epoch=state.epoch_index,
-                    data_time=data_timer.value,
-                    model_time=model_timer.value,
-                )
-                progress_bar.set_postfix(**logs)
-                if average_autoencoder_loss is not None:
-                    logs["autoencoder_train_loss"] = average_autoencoder_loss.item()
-                    average_autoencoder_loss = None
-                if average_discriminator_loss is not None:
-                    logs["discriminator_train_loss"] = average_discriminator_loss.item()
-                    average_discriminator_loss = None
-                accelerator.log(logs, step=state.step_index)
+            if state.step_index != 0:
+                if accelerator.sync_gradients and accelerator.is_main_process:
+                    learning_rate = autoencoder.learning_rate_scheduler.get_last_lr()[0]
+                    logs = dict(
+                        learning_rate=learning_rate,
+                        epoch=state.epoch_index.item(),
+                        data_time=data_timer.value,
+                        model_time=model_timer.value,
+                    )
+                    progress_bar.set_postfix(**logs)
+                    if average_autoencoder_loss is not None:
+                        logs["autoencoder_train_loss"] = average_autoencoder_loss.item()
+                        average_autoencoder_loss = None
+                    if average_discriminator_loss is not None:
+                        logs["discriminator_train_loss"] = (
+                            average_discriminator_loss.item()
+                        )
+                        average_discriminator_loss = None
+                    accelerator.log(logs, step=state.step_index.item())
 
-                if state.step_index % checkpoint_steps == 0:
-                    checkpoint(state)
-            if state.step_index % val_steps == 0:
-                validate(state=state, model=autoencoder.model)
+                    if state.step_index % checkpoint_steps == 0:
+                        checkpoint()
+                if state.step_index % val_steps == 0:
+                    validate()
             state.step_index += 1
+
+            if profile is not None:
+                profile.step()
 
             data_timer.start()
 
@@ -177,11 +186,16 @@ class Trainer:
 
     batch_size: int
     gradient_accumulation_steps: int
+
     epoch_count: int
+    max_step_count: int | None = None
+
+    is_profile: bool = False
 
     val_steps: int = 100
     val_count: int = 50
     checkpoint_steps: int = 500
+    discriminator_warmup_steps: int = 30000
 
     artifact_path: Path = field(init=False)
     accelerator: Accelerator = field(init=False)
@@ -190,12 +204,11 @@ class Trainer:
     def __post_init__(self) -> None:
         if self.datastore.cache_path is None:
             raise ValueError("Datastore cache path is None")
-        self.checkpoint_prefix = (
-            f"dataset-{self.datastore.name}_model-autoencoder_step-"
-        )
+        prefix = f"dataset-{self.datastore.name}_model-autoencoder"
+        self.checkpoint_prefix = f"{prefix}_step-"
         self.artifact_path = self.datastore.cache_path
 
-        fullgraph = True
+        fullgraph: bool = True
         mixed_precision = "bf16"
         kwargs_handlers: list[Any] = list()
         # mixed_precision = "fp8"
@@ -206,18 +219,47 @@ class Trainer:
         fsdp_plugin: FullyShardedDataParallelPlugin | None = None
         # deepspeed_plugin: DeepSpeedPlugin
 
-        cuda_device_count = torch.cuda.device_count()
+        if self.is_profile:
+            output_trace_dir = self.artifact_path / f"{prefix}_profile"
+            output_trace_dir.mkdir(parents=True, exist_ok=True)
+
+            def on_trace_ready(profile: torch.profiler.profile) -> None:
+                logger.info(
+                    profile.key_averages().table(
+                        sort_by="self_cuda_time_total", row_limit=10
+                    )
+                )
+                profile.export_chrome_trace(
+                    str(output_trace_dir / f"trace-{profile.step_num}.json")
+                )
+
+            kwargs_handlers.append(
+                ProfileKwargs(
+                    activities=["cpu", "cuda"],
+                    schedule_option={
+                        "skip_first": 10,
+                        "wait": 5,
+                        "warmup": 1,
+                        "active": 3,
+                        "repeat": 2,
+                    },
+                    # with_stack=True,
+                    on_trace_ready=on_trace_ready,
+                )
+            )
+
         logger.info(f"{torch.cuda.device_count()=}")
-        if cuda_device_count > 1:
+        local_rank = os.environ.get("LOCAL_RANK")
+        if local_rank is not None:
             fullgraph = False
-            torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
+            torch.cuda.set_device(int(local_rank))
             kwargs_handlers.append(
                 DistributedDataParallelKwargs(
                     comm_hook=DDPCommunicationHookType[mixed_precision.upper()]
                 )
             )
 
-        tensorboard_path = self.artifact_path / "tensorboard"
+        tensorboard_path = self.artifact_path / f"{prefix}_tensorboard"
         tensorboard_path.mkdir(parents=True, exist_ok=True)
 
         self.accelerator = Accelerator(
@@ -225,7 +267,7 @@ class Trainer:
             gradient_accumulation_steps=self.gradient_accumulation_steps,
             dynamo_plugin=TorchDynamoPlugin(
                 backend="inductor",
-                fullgraph=fullgraph,  # , mode="reduce-overhead"
+                fullgraph=fullgraph,  # mode="reduce-overhead"
             ),
             fsdp_plugin=fsdp_plugin,
             kwargs_handlers=kwargs_handlers,
@@ -234,8 +276,8 @@ class Trainer:
             ),
         )
 
-        torch._dynamo.config.cache_size_limit = 1 << 10
-        torch.set_float32_matmul_precision("high")
+        if not self.is_profile:
+            self.accelerator.profile = nullcontext
 
         logger.info(f"{self.accelerator.is_main_process=}")
         logger.info(f"{torch.cuda.get_device_properties(self.accelerator.device)=}")
@@ -266,49 +308,61 @@ class Trainer:
 
         if latest_checkpoint is not None:
             self.accelerator.load_state(latest_checkpoint)
-            logger.info(f"Resuming from {state}")
+            logger.info(f"Resuming from {state.epoch_index=} {state.step_index=}")
 
         def val_iterator() -> Iterator[tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
             while True:
                 yield from val_dataloader
 
-        for epoch_index in range(
-            state.epoch_index, state.epoch_index + self.epoch_count
-        ):
-            state.epoch_index = epoch_index
+        lpips: Any = LPIPS().to(self.accelerator.device)
+        lpips = torch.compile(lpips, **self.accelerator.state.dynamo_plugin.to_kwargs())
+        autoencoder_loss: Any = AutoencoderLoss(
+            state=state,
+            autoencoder=autoencoder,
+            discriminator=discriminator,
+            discriminator_warmup_steps=torch.tensor(self.discriminator_warmup_steps),
+            lpips=lpips,
+        ).to(self.accelerator.device)
+        # autoencoder_loss = torch.compile(
+        #     autoencoder_loss, **self.accelerator.state.dynamo_plugin.to_kwargs()
+        # )
 
+        for _ in range(self.epoch_count):
             epoch(
                 state=state,
                 accelerator=self.accelerator,
                 autoencoder=autoencoder,
+                autoencoder_loss=autoencoder_loss,
                 discriminator=discriminator,
                 train_dataloader=train_dataloader,
-                checkpoint=self.checkpoint,
+                checkpoint=partial(self.checkpoint, state=state),
                 checkpoint_steps=self.checkpoint_steps,
                 validate=partial(
                     validate,
+                    state=state,
                     accelerator=self.accelerator,
+                    model=autoencoder.model,
                     val_iterator=val_iterator(),
                     val_count=self.val_count,
                 ),
                 val_steps=self.val_steps,
+                max_step_count=self.max_step_count,
             )
+            state.epoch_index += 1
 
-            self.accelerator.wait_for_everyone()
-            self.checkpoint(state)
+        self.accelerator.wait_for_everyone()
+        self.checkpoint(state)
 
         self.accelerator.end_training()
 
     def run(self) -> None:
         channel_count = self.data_module_class.channel_count
         autoencoder_model = get_model(channel_count)
-        autoencoder_optimizer = bitsandbytes.optim.AdamW8bit(
-            autoencoder_model.parameters(), lr=1e-4
-        )
+        logger.info(f"{autoencoder_model.num_parameters()=}")
+        get_optimizer = partial(bitsandbytes.optim.Lion, optim_bits=32)
+        autoencoder_optimizer = get_optimizer(autoencoder_model.parameters())
         discriminator_model = get_discriminator_model(channel_count)
-        discriminator_optimizer = bitsandbytes.optim.AdamW8bit(
-            discriminator_model.parameters(), lr=1e-4
-        )
+        discriminator_optimizer = get_optimizer(discriminator_model.parameters())
 
         def save_model_hook(
             models: list[torch.nn.Module], weights: list[Any], output_dir: Path | str
@@ -352,7 +406,7 @@ class Trainer:
             self.datastore,
             generator=torch.Generator(device="cpu").manual_seed(self.seed),
             lengths=(0.8, 0.15, 0.05),
-            image_size=512,
+            image_size=image_size,
             train_batch_size=self.batch_size,
             eval_batch_size=self.batch_size,
         )

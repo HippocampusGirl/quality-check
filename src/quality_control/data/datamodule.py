@@ -1,8 +1,12 @@
+import random
 from functools import partial
 from typing import Any, Callable, ClassVar, Sequence, TypeAlias
 
+import albumentations
+import cv2
 import numpy as np
 import torch
+import torchvision.transforms.v2 as transforms
 from lightning.pytorch import LightningDataModule
 from numpy import typing as npt
 from torch.utils.data import (
@@ -13,9 +17,8 @@ from torch.utils.data import (
     random_split,
 )
 from torch.utils.data import Dataset as _Dataset
-from torchvision.transforms import v2 as transforms
 
-from ..utils import cpu_count
+from ..utils import apply_num_threads, cpu_count
 from .augmentation import RandomHorizontalResizedCrop
 from .dataset import (
     Image,
@@ -24,6 +27,11 @@ from .dataset import (
     get_channels,
 )
 from .schema import Datastore
+
+
+def worker_init(worker_id: int) -> None:
+    apply_num_threads(1)
+    cv2.setNumThreads(1)
 
 
 def get_weights(datasets: Sequence[ImageDataset]) -> npt.NDArray[np.float32]:
@@ -75,6 +83,8 @@ class BaseDataModule(LightningDataModule):
         super().__init__()
 
         self.generator = generator
+        random.seed(torch.randint(1 << 32, (), generator=generator).item())
+        np.random.seed(torch.randint(1 << 32, (), generator=generator).item())
 
         if self.generator.device.type == "cpu":
             self.num_workers = cpu_count()
@@ -136,6 +146,7 @@ class BaseDataModule(LightningDataModule):
             generator=self.generator,
             num_workers=self.num_workers,
             persistent_workers=self.num_workers > 0,
+            worker_init_fn=worker_init,
             prefetch_factor=10,
             pin_memory=False,
         )
@@ -198,9 +209,12 @@ class TensorDataset(_Dataset[tuple[torch.Tensor, torch.Tensor]]):
         class_label = self.classes.index(
             (*tuple(image.channels), *tuple(image.position))
         )
-        tensor = torch.tensor(image.data).permute(2, 0, 1)
-        data = self.preprocess(tensor)
-        return data, torch.tensor(class_label)
+        data: npt.NDArray[np.uint8] = self.preprocess(
+            image=image.data.transpose(2, 0, 1)
+        )
+        return transforms.functional.to_dtype(
+            torch.tensor(data), scale=True
+        ), torch.tensor(class_label)
 
 
 # Maybe use StackDataset instead of GoodBadDataset
@@ -230,21 +244,51 @@ class GoodBadDataset(_Dataset[tuple[torch.Tensor, torch.Tensor, torch.Tensor]]):
 class SliceDataModule(BaseDataModule):
     @classmethod
     def get_preprocess(cls, image_size: int, is_augmentation: bool) -> Any:
-        transform_list: list[transforms.Transform] = [
-            transforms.Resize(None, max_size=image_size),
-            transforms.CenterCrop(size=(image_size, image_size)),
+        transform_list: list[albumentations.BasicTransform] = [
+            albumentations.LongestMaxSize(
+                max_size=image_size, interpolation=cv2.INTER_LINEAR
+            ),
+            albumentations.CenterCrop(
+                height=image_size, width=image_size, pad_if_needed=True
+            ),
         ]
         if is_augmentation:
+            scale = 0.05
+            angle = 5
             transform_list.extend(
                 (
-                    transforms.RandomHorizontalFlip(p=0.5),
-                    transforms.ElasticTransform(alpha=100.0, sigma=10.0),
+                    albumentations.HorizontalFlip(p=0.5),
+                    albumentations.Affine(
+                        scale=(1 - scale, 1 + scale),
+                        rotate=(-angle, angle),
+                        translate_percent=(-0.05, 0.05),
+                        shear=dict(x=(-angle, angle), y=(-angle, angle)),
+                        interpolation=cv2.INTER_LINEAR,
+                        p=1.0,
+                    ),
+                    albumentations.GridDistortion(
+                        num_steps=25, interpolation=cv2.INTER_LINEAR, p=1.0
+                    ),
+                    albumentations.RandomGamma(p=1.0),
                 )
             )
-        transform_list.append(
-            transforms.ToDtype(torch.float32, scale=True),
+        return albumentations.Compose(
+            transform_list,
+            additional_targets=dict(
+                image0="image",
+                mask0="mask",
+                mask1="mask",
+                mask2="mask",
+                mask3="mask",
+                mask4="mask",
+                mask5="mask",
+                mask6="mask",
+                mask7="mask",
+                mask8="mask",
+                mask9="mask",
+                mask10="mask",
+            ),
         )
-        return transforms.Compose(transform_list)
 
     def __init__(
         self,
@@ -323,17 +367,21 @@ class DataModule3(BaseDataModule):
 
     @classmethod
     def get_preprocess(cls, image_size: int, is_augmentation: bool) -> Any:
-        transform_list: list[transforms.Transform] = list()
+        transform_list: list[albumentations.BasicTransform] = list()
         if is_augmentation:
             transform_list.append(
                 RandomHorizontalResizedCrop(
-                    size=(image_size, image_size), scale=(0.3, 1.0)
+                    size=(image_size, image_size), scale=(0.3, 1.0), p=1.0
                 )
             )
         else:
-            transform_list.append(transforms.Resize(size=(image_size, image_size)))
-        transform_list.append(transforms.ToDtype(torch.float32, scale=True))
-        return transforms.Compose(transform_list)
+            transform_list.append(
+                albumentations.Resize(height=image_size, width=image_size, p=1.0)
+            )
+        return albumentations.Compose(
+            transform_list,
+            additional_targets=dict(image0="image"),
+        )
 
     def __init__(
         self,
@@ -393,26 +441,33 @@ class TwoChannelDataModule(BaseDataModule):
         preprocess_slice = SliceDataModule.get_preprocess(image_size, is_augmentation)
         preprocess_bold_conf = DataModule3.get_preprocess(image_size, is_augmentation)
 
-        def preprocess(tensor: torch.Tensor) -> Any:
-            channel_count = tensor.shape[
+        def preprocess(image: npt.NDArray[np.uint8]) -> npt.NDArray[np.uint8]:
+            channel_count = image.shape[
                 -3
             ]  # shape is ..., channel_count, height, width
-            if channel_count == 2:
-                return preprocess_slice(tensor)
+            if channel_count == 2:  # skull_strip_report and tsnr_rpt
+                data_dict = preprocess_slice(image=image[0, ...], mask=image[1, ...])
+                data_sequence = [data_dict["image"], data_dict["mask"]]
             elif channel_count == 6:
-                return preprocess_bold_conf(tensor[(0, -1), ...])
+                data_dict = preprocess_bold_conf(
+                    image=image[0, ...], image0=image[-1, ...]
+                )
+                data_sequence = [data_dict["image"], data_dict["image0"]]
             elif channel_count == 12:
-                weights = torch.tensor(
-                    [170, 43, 212, 128, 149, 234, 234, 191, 128, 212, 255],
-                    dtype=torch.uint8,
+                weights = np.array(
+                    [170, 212, 43, 128, 149, 234, 234, 191, 128, 212, 255],
+                    dtype=np.uint8,
                 )
-                merge, _ = (tensor[1:-1] * weights[:-1, np.newaxis, np.newaxis]).max(
-                    dim=0
-                )
-                merge[torch.logical_and(merge == 0, tensor[-1] != 0)] = weights[-1]
-                tensor = torch.cat([tensor[np.newaxis, 0, ...], merge[np.newaxis, ...]])
-                return preprocess_slice(tensor)
+                keys = ["image", "mask", *(f"mask{i}" for i in range(10))]
+                data_dict = preprocess_slice(**dict(zip(keys, image, strict=True)))
+                data_sequence = [data_dict[key] for key in keys]
+                data = np.stack(data_sequence)
+                merge = (data[1:-1] * weights[:-1, np.newaxis, np.newaxis]).max(axis=0)
+                merge[np.logical_and(merge == 0, data[-1] != 0)] = weights[-1]
+                data_sequence = [data[0], merge]
             else:
                 raise ValueError
+
+            return np.stack(data_sequence)
 
         return preprocess

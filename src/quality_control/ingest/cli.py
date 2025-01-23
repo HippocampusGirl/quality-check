@@ -4,7 +4,6 @@ import traceback
 from argparse import ArgumentParser, Namespace
 from contextlib import nullcontext
 from functools import cache, partial
-from itertools import chain
 from multiprocessing import get_context, parent_process
 from pathlib import Path
 from subprocess import check_output
@@ -97,13 +96,13 @@ def parse_image(job: Job, debug: bool = False) -> Iterable[CompressedReport]:
             image_bytes = compress_image(image)
             compressed_reports.append(CompressedReport(image_bytes, direction, i, tags))
     except Exception:
-        print(f'Error parsing "{path}": {traceback.format_exc()}', flush=True)
+        tqdm.write(f'Error parsing "{path}": {traceback.format_exc()}', flush=True)
         if debug and parent_process() is None:
             pdb.post_mortem()
         return list()
     else:
         if len(compressed_reports) == 0:
-            print(f'Did not parse any images from "{path}"')
+            tqdm.write(f'Did not parse any images from "{path}"')
         return compressed_reports
 
 
@@ -165,12 +164,13 @@ def generate_jobs(
             ):
                 datastore.remove_image(image_id)
 
-    # paths = index.get(**query)
-    paths = list(
-        chain.from_iterable(
-            list(index.get(suffix=suffix))[:100] for suffix in image_parsers
-        )
-    )
+    paths = index.get(**query)
+    # from itertools import chain
+    # paths = list(
+    #     chain.from_iterable(
+    #         list(index.get(suffix=suffix))[:100] for suffix in image_parsers
+    #     )
+    # )
     for path in paths:
         suffix = index.get_tag_value(path, "suffix")
         if suffix is None:
