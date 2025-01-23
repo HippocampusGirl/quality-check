@@ -10,20 +10,13 @@ image_size: int = 512
 
 
 def get_model(channel_count: int) -> torch.nn.Module:
-    # https://github.com/fpsandnoob/vss/blob/main/configs/model/vqvae_512.yaml
+    # https://huggingface.co/kandinsky-community/kandinsky-2-2-decoder/blob/main/movq/config.json
     model = model_class(
         in_channels=channel_count,
         out_channels=channel_count,
         act_fn="silu",
-        block_out_channels=[
-            64,
-            128,
-            256,
-            256,
-            512,
-        ],
+        block_out_channels=[128, 256, 256, 512],
         down_block_types=[
-            "DownEncoderBlock2D",
             "DownEncoderBlock2D",
             "DownEncoderBlock2D",
             "DownEncoderBlock2D",
@@ -38,7 +31,6 @@ def get_model(channel_count: int) -> torch.nn.Module:
         scaling_factor=0.18215,
         up_block_types=[
             "AttnUpDecoderBlock2D",
-            "UpDecoderBlock2D",
             "UpDecoderBlock2D",
             "UpDecoderBlock2D",
             "UpDecoderBlock2D",

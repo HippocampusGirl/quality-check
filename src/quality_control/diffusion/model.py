@@ -18,7 +18,7 @@ def get_model(
     channel_count: int,
     class_count: int,
 ) -> torch.nn.Module:
-    block_count = trial.suggest_int("block_count", 2, 6)
+    block_count = trial.suggest_int("block_count", 1, 6)
     down_block_types: list[str] = list()
     up_block_types: list[str] = list()
     for i in range(block_count):

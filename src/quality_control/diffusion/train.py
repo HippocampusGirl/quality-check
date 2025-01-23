@@ -40,7 +40,7 @@ from .validate import validate
 
 torch._dynamo.config.cache_size_limit = 1 << 10
 torch.set_float32_matmul_precision("high")
-torch.multiprocessing.set_sharing_strategy("file_system")  # type: ignore
+# torch.multiprocessing.set_sharing_strategy("file_system")  # type: ignore
 
 
 def epoch(
@@ -86,14 +86,12 @@ def epoch(
             with torch.no_grad():
                 batch_size = clean_images.size(0)
                 clean_images = VaeImageProcessor.normalize(clean_images)
-
                 clean_latents = (
                     autoencoder_model.encode(clean_images).latents
                     * autoencoder_model.config.scaling_factor
                 )
                 # Sample noise to add to the images
                 noise = torch.empty_like(clean_latents).normal_(generator=generator)
-
                 timesteps = torch.randint(
                     0,
                     timestep_count,
@@ -102,7 +100,6 @@ def epoch(
                     device=accelerator.device,
                     generator=generator,
                 )
-
                 noisy_latents = noise_scheduler.add_noise(  # type: ignore
                     clean_latents, noise, timesteps
                 )
@@ -131,6 +128,8 @@ def epoch(
 
             if progress_bar.n < 10:  # Reset timers after warmup
                 progress_bar.start_t = progress_bar._time()
+                model_timer.reset()
+                data_timer.reset()
 
             progress_bar.update(1)
             if state.step_index != 0:
@@ -146,10 +145,9 @@ def epoch(
                     progress_bar.set_postfix(**logs)
                     accelerator.log(logs, step=state.step_index.item())
 
-                    if state.step_index.item() > val_steps // 2:
-                        rate = progress_bar.format_dict["rate"]
-                        remaining = (progress_bar.total - progress_bar.n) / rate
-                        if remaining > 10000:
+                    if progress_bar.n > val_steps // 2:
+                        time = progress_bar.total * model_timer.value
+                        if time > 3600:
                             raise TimeoutError
                 if state.step_index % checkpoint_steps == 0:
                     checkpoint()
@@ -477,7 +475,7 @@ class Trainer:
                 stack_info=False,
             )
             # Exit immediately without letting optuna mark the trial as failed
-            os.kill(os.getpid(), signal.SIGKILL)
+            os.kill(os.getpid(), signal.SIGTERM)
         finally:
             torch.cuda.set_per_process_memory_fraction(1.0)
             self.accelerator.free_memory()

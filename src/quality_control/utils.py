@@ -42,6 +42,10 @@ class Timer:
         self.numerator += time() - self.start_time
         self.denominator += 1
 
+    def reset(self) -> None:
+        self.numerator = 0.0
+        self.denominator = 0
+
     @property
     def value(self) -> float:
         if self.denominator > 0:
