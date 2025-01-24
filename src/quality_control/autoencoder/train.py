@@ -195,7 +195,7 @@ class Trainer:
     val_steps: int = 100
     val_count: int = 50
     checkpoint_steps: int = 500
-    discriminator_warmup_steps: int = 30000
+    discriminator_warmup_steps: int = 10000
 
     artifact_path: Path = field(init=False)
     accelerator: Accelerator = field(init=False)
