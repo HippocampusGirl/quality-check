@@ -200,6 +200,24 @@ class Trainer:
     )
 
     def __post_init__(self) -> None:
+        parameter_count = self.autoencoder_model.num_parameters()
+        memory_footprint: float = (
+            self.autoencoder_model.get_memory_footprint(return_buffers=True) / 1e9
+        )
+        logger.info(f"autoencoder_model {memory_footprint=} {parameter_count=}")
+
+        data_module = self.data_module_class(
+            self.datastore,
+            generator=torch.Generator(device="cpu").manual_seed(self.seed),
+            lengths=(0.8, 0.15, 0.05),
+            image_size=image_size,
+            train_batch_size=self.batch_size,
+            eval_batch_size=self.batch_size,
+            autoencoder_model=self.autoencoder_model,
+        )
+        self.train_dataloader = data_module.train_dataloader()
+        self.val_dataloader = data_module.val_dataloader()
+
         if self.datastore.cache_path is None:
             raise ValueError("Datastore cache path is None")
         self.artifact_path = self.datastore.cache_path
@@ -268,27 +286,6 @@ class Trainer:
 
         if not self.is_profile:
             self.accelerator.profile = nullcontext
-
-        self.autoencoder_model = self.autoencoder_model.to(self.accelerator.device)
-        self.autoencoder_model = torch.compile(
-            self.autoencoder_model, **self.accelerator.state.dynamo_plugin.to_kwargs()
-        )
-        parameter_count = self.autoencoder_model.num_parameters()
-        memory_footprint: float = (
-            self.autoencoder_model.get_memory_footprint(return_buffers=True) / 1e9
-        )
-        logger.info(f"autoencoder_model {memory_footprint=} {parameter_count=}")
-
-        data_module = self.data_module_class(
-            self.datastore,
-            generator=torch.Generator(device="cpu").manual_seed(self.seed),
-            lengths=(0.8, 0.15, 0.05),
-            image_size=image_size,
-            train_batch_size=self.batch_size,
-            eval_batch_size=self.batch_size,
-        )
-        self.train_dataloader = data_module.train_dataloader()
-        self.val_dataloader = data_module.val_dataloader()
 
     def checkpoint(self, trial: optuna.trial.Trial) -> None:
         with TemporaryDirectory() as temporary_directory_str:

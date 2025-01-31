@@ -79,6 +79,7 @@ class BaseDataModule(LightningDataModule):
         lengths: tuple[float, float, float],
         train_batch_size: int,
         eval_batch_size: int,
+        autoencoder_model: torch.nn.Module | None = None,
     ):
         super().__init__()
 
@@ -253,19 +254,19 @@ class SliceDataModule(BaseDataModule):
             ),
         ]
         if is_augmentation:
-            scale = 0.05
-            angle = 5
+            # scale = 0.05
+            # angle = 5
             transform_list.extend(
                 (
                     albumentations.HorizontalFlip(p=0.5),
-                    albumentations.Affine(
-                        scale=(1 - scale, 1 + scale),
-                        rotate=(-angle, angle),
-                        translate_percent=(-0.05, 0.05),
-                        shear=dict(x=(-angle, angle), y=(-angle, angle)),
-                        interpolation=cv2.INTER_LINEAR,
-                        p=1.0,
-                    ),
+                    # albumentations.Affine(
+                    #     scale=(1 - scale, 1 + scale),
+                    #     rotate=(-angle, angle),
+                    #     translate_percent=(-0.05, 0.05),
+                    #     shear=dict(x=(-angle, angle), y=(-angle, angle)),
+                    #     interpolation=cv2.INTER_LINEAR,
+                    #     p=1.0,
+                    # ),
                     albumentations.GridDistortion(
                         num_steps=25, interpolation=cv2.INTER_LINEAR, p=1.0
                     ),
@@ -299,6 +300,7 @@ class SliceDataModule(BaseDataModule):
         image_size: int,
         train_batch_size: int,
         eval_batch_size: int,
+        autoencoder_model: torch.nn.Module | None = None,
     ):
         super().__init__(
             datastore,
@@ -308,12 +310,14 @@ class SliceDataModule(BaseDataModule):
             lengths,
             train_batch_size,
             eval_batch_size,
+            autoencoder_model=autoencoder_model,
         )
 
 
 class DataModule1(SliceDataModule):
     channel_count = 2
     class_count = 42
+    name = "m1"
 
     def __init__(
         self,
@@ -323,6 +327,7 @@ class DataModule1(SliceDataModule):
         image_size: int,
         train_batch_size: int,
         eval_batch_size: int,
+        autoencoder_model: torch.nn.Module | None = None,
     ):
         image_types = [ImageType.skull_strip_report, ImageType.tsnr_rpt]
         super().__init__(
@@ -333,12 +338,14 @@ class DataModule1(SliceDataModule):
             image_size,
             train_batch_size,
             eval_batch_size,
+            autoencoder_model=autoencoder_model,
         )
 
 
 class DataModule2(SliceDataModule):
     channel_count = 12
     class_count = 42
+    name = "m2"
 
     def __init__(
         self,
@@ -348,6 +355,7 @@ class DataModule2(SliceDataModule):
         image_size: int,
         train_batch_size: int,
         eval_batch_size: int,
+        autoencoder_model: torch.nn.Module | None = None,
     ):
         image_types = [ImageType.t1_norm_rpt, ImageType.epi_norm_rpt]
         super().__init__(
@@ -358,12 +366,14 @@ class DataModule2(SliceDataModule):
             image_size,
             train_batch_size,
             eval_batch_size,
+            autoencoder_model=autoencoder_model,
         )
 
 
 class DataModule3(BaseDataModule):
     channel_count = 6
     class_count = 1
+    name = "m3"
 
     @classmethod
     def get_preprocess(cls, image_size: int, is_augmentation: bool) -> Any:
@@ -391,6 +401,7 @@ class DataModule3(BaseDataModule):
         image_size: int,
         train_batch_size: int,
         eval_batch_size: int,
+        autoencoder_model: torch.nn.Module | None = None,
     ):
         image_types = [ImageType.bold_conf]
         super().__init__(
@@ -401,6 +412,7 @@ class DataModule3(BaseDataModule):
             lengths,
             train_batch_size,
             eval_batch_size,
+            autoencoder_model=autoencoder_model,
         )
 
 
@@ -410,6 +422,7 @@ DataModule: TypeAlias = DataModule1 | DataModule2 | DataModule3
 class TwoChannelDataModule(BaseDataModule):
     channel_count = 2
     class_count = 21 + 21 + 21 + 1 + 21
+    name = "2c"
 
     def __init__(
         self,
@@ -419,6 +432,7 @@ class TwoChannelDataModule(BaseDataModule):
         image_size: int,
         train_batch_size: int,
         eval_batch_size: int,
+        autoencoder_model: torch.nn.Module | None = None,
     ):
         image_types = [
             ImageType.skull_strip_report,
@@ -435,6 +449,7 @@ class TwoChannelDataModule(BaseDataModule):
             lengths,
             train_batch_size,
             eval_batch_size,
+            autoencoder_model=autoencoder_model,
         )
 
     def get_preprocess(self, image_size: int, is_augmentation: bool) -> Any:
