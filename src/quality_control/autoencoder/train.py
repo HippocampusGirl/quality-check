@@ -35,6 +35,7 @@ from .model import (
     get_model,
     image_size,
     model_class,
+    model_name,
 )
 from .validate import validate
 
@@ -204,7 +205,7 @@ class Trainer:
     def __post_init__(self) -> None:
         if self.datastore.cache_path is None:
             raise ValueError("Datastore cache path is None")
-        prefix = f"dataset-{self.datastore.name}_model-autoencoder"
+        prefix = f"data-{self.data_module_class.name}_model-{model_name}"
         self.checkpoint_prefix = f"{prefix}_step-"
         self.artifact_path = self.datastore.cache_path
 
