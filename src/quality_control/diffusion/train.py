@@ -22,7 +22,6 @@ from accelerate.utils import (
     TorchDynamoPlugin,
 )
 from diffusers import DDPMScheduler
-from diffusers.image_processor import VaeImageProcessor
 from optuna.artifacts import FileSystemArtifactStore, download_artifact, upload_artifact
 from optuna.storages import RetryFailedTrialCallback
 from torch.nn.functional import mse_loss
@@ -47,7 +46,6 @@ def epoch(
     state: TrainingState,
     accelerator: Accelerator,
     generator: torch.Generator,
-    autoencoder_model: torch.nn.Module,
     diffusion_model: torch.nn.Module,
     optimizer: torch.optim.Optimizer,
     learning_rate_scheduler: torch.optim.lr_scheduler.LambdaLR,
@@ -63,7 +61,6 @@ def epoch(
 ) -> float:
     r2: float = 0.0
 
-    autoencoder_model = autoencoder_model.eval()
     diffusion_model = diffusion_model.train()
 
     data_timer = Timer()
@@ -82,14 +79,9 @@ def epoch(
         ) as progress_bar,
         accelerator.profile() as profile,
     ):
-        for clean_images, class_labels in islice(train_dataloader, max_step_count):
+        for clean_latents, class_labels in islice(train_dataloader, max_step_count):
             with torch.no_grad():
-                batch_size = clean_images.size(0)
-                clean_images = VaeImageProcessor.normalize(clean_images)
-                clean_latents = (
-                    autoencoder_model.encode(clean_images).latents
-                    * autoencoder_model.config.scaling_factor
-                )
+                batch_size = clean_latents.size(0)
                 # Sample noise to add to the images
                 noise = torch.empty_like(clean_latents).normal_(generator=generator)
                 timesteps = torch.randint(
@@ -371,7 +363,6 @@ class Trainer:
                 state=state,
                 accelerator=self.accelerator,
                 generator=generator,
-                autoencoder_model=self.autoencoder_model,
                 diffusion_model=diffusion_model,
                 optimizer=optimizer,
                 learning_rate_scheduler=learning_rate_scheduler,

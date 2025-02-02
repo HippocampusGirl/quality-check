@@ -27,8 +27,8 @@ from ..data.schema import Datastore
 from ..logging import logger
 from ..utils import Timer, TrainingState
 from .base import Model
-from .discriminator import Discriminator
-from .loss import LPIPS, AutoencoderLoss, grad
+from .discriminator import Discriminator, gradient_penalty
+from .loss import LPIPS, AutoencoderLoss
 from .model import (
     get_discriminator_model,
     get_learning_rate_scheduler,
@@ -41,14 +41,6 @@ from .validate import validate
 
 torch._dynamo.config.cache_size_limit = 1 << 10
 torch.set_float32_matmul_precision("high")
-
-
-def gradient_penalty(
-    output: torch.Tensor, images: torch.Tensor, weight: float = 10.0
-) -> Any:
-    gradients = grad(output, images)
-    gradients = torch.reshape(gradients, (gradients.size(0), -1))
-    return weight * ((gradients.norm(2, dim=1) - 1) ** 2).mean()
 
 
 def epoch(  # noqa: C901
@@ -129,8 +121,8 @@ def epoch(  # noqa: C901
                     score = discriminator.model(images)
 
                     loss = (
-                        torch.nn.functional.relu(1 + reconstructed_score)
-                        + torch.nn.functional.relu(1 - score)
+                        torch.nn.functional.relu(1.0 + reconstructed_score)
+                        + torch.nn.functional.relu(1.0 - score)
                     ).mean()
                     loss += gradient_penalty(score, images)
 
@@ -196,6 +188,7 @@ class Trainer:
     val_steps: int = 100
     val_count: int = 50
     checkpoint_steps: int = 500
+    # https://github.com/CompVis/taming-transformers/issues/93
     discriminator_warmup_steps: int = 10000
 
     artifact_path: Path = field(init=False)
@@ -360,10 +353,13 @@ class Trainer:
         channel_count = self.data_module_class.channel_count
         autoencoder_model = get_model(channel_count)
         logger.info(f"{autoencoder_model.num_parameters()=}")
-        get_optimizer = partial(bitsandbytes.optim.Lion, optim_bits=32)
-        autoencoder_optimizer = get_optimizer(autoencoder_model.parameters())
+        autoencoder_optimizer = bitsandbytes.optim.Lion(
+            autoencoder_model.parameters(), optim_bits=32
+        )
         discriminator_model = get_discriminator_model(channel_count)
-        discriminator_optimizer = get_optimizer(discriminator_model.parameters())
+        discriminator_optimizer = bitsandbytes.optim.AdamW(
+            discriminator_model.parameters(), optim_bits=32
+        )
 
         def save_model_hook(
             models: list[torch.nn.Module], weights: list[Any], output_dir: Path | str

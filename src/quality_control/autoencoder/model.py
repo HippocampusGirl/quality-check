@@ -5,9 +5,9 @@ from ..diffusion.model import get_learning_rate_scheduler as get_learning_rate_s
 from .discriminator import Discriminator
 
 model_class = VQModel
-model_name = "a5ja"
+model_name = "f4a"
 
-image_size: int = 512
+image_size: int = 256
 
 
 def get_model(channel_count: int) -> torch.nn.Module:
@@ -16,14 +16,12 @@ def get_model(channel_count: int) -> torch.nn.Module:
         out_channels=channel_count,
         act_fn="silu",
         block_out_channels=[
-            64,
             128,
             256,
             256,
             512,
         ],
         down_block_types=[
-            "DownEncoderBlock2D",
             "DownEncoderBlock2D",
             "DownEncoderBlock2D",
             "DownEncoderBlock2D",
@@ -38,7 +36,6 @@ def get_model(channel_count: int) -> torch.nn.Module:
         sample_size=32,
         scaling_factor=0.18215,
         up_block_types=[
-            "UpDecoderBlock2D",
             "UpDecoderBlock2D",
             "UpDecoderBlock2D",
             "UpDecoderBlock2D",

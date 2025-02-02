@@ -90,12 +90,13 @@ class AutoencoderLoss(torch.nn.Module):
         self.discriminator = discriminator
 
         self.discriminator_warmup_steps = discriminator_warmup_steps
-        self.jukebox_loss = JukeboxLoss()
+        # self.jukebox_loss = JukeboxLoss()
         self.lpips = lpips
 
     def get_adaptive_weight(
         self, loss: torch.Tensor, discriminator_loss: torch.Tensor
     ) -> Any:
+        # https://github.com/CompVis/taming-transformers/blob/master/taming/modules/losses/vqperceptual.py
         decoder_layer = extract_model_from_parallel(
             self.autoencoder.model
         ).decoder.conv_out.weight
@@ -119,14 +120,15 @@ class AutoencoderLoss(torch.nn.Module):
         # https://github.com/marksgraham/ddpm-ood/blob/main/src/trainers/vqvae_trainer.py#L101
         loss += 0.001 * perceptual_loss
 
-        loss += self.jukebox_loss(reconstructed_images, images)
+        # loss += self.jukebox_loss(reconstructed_images, images)
 
         is_warmup = self.state.step_index < self.discriminator_warmup_steps
         if not is_warmup:
-            discriminator_loss = -self.discriminator.model(reconstructed_images).mean()
-            # https://github.com/marksgraham/ddpm-ood/blob/main/train_vqvae.py#L71
-            loss += (
-                self.get_adaptive_weight(loss, discriminator_loss) * discriminator_loss
+            discriminator_loss = torch.nn.functional.relu(
+                1.0 - self.discriminator.model(reconstructed_images).mean()
             )
+            # https://github.com/marksgraham/ddpm-ood/blob/main/train_vqvae.py#L71
+            weight = self.get_adaptive_weight(loss, discriminator_loss)
+            loss += weight * discriminator_loss
 
         return loss

@@ -7,6 +7,7 @@ import cv2
 import numpy as np
 import torch
 import torchvision.transforms.v2 as transforms
+from diffusers.image_processor import VaeImageProcessor
 from lightning.pytorch import LightningDataModule
 from numpy import typing as npt
 from torch.utils.data import (
@@ -118,7 +119,9 @@ class BaseDataModule(LightningDataModule):
         _train_dataset, _val_dataset_good, _test_dataset_good = random_split(
             good_dataset, self.lengths, generator=self.generator
         )
-        self.train_dataset = tensor_dataset_factory(train_preprocess, _train_dataset)
+        self.train_dataset = tensor_dataset_factory(
+            train_preprocess, _train_dataset, autoencoder_model=autoencoder_model
+        )
         val_dataset_factory = partial(tensor_dataset_factory, val_preprocess)
         val_dataset_good = val_dataset_factory(_val_dataset_good)
         test_dataset_good = val_dataset_factory(_test_dataset_good)
@@ -191,14 +194,27 @@ class BaseDataModule(LightningDataModule):
         return self.get_data_loader(self.test_dataset)
 
 
+@torch.compile()
+def encode(autoencoder_model: torch.nn.Module, data: torch.Tensor) -> Any:
+    data = VaeImageProcessor.normalize(data)
+    return (
+        autoencoder_model.encode(data).latents * autoencoder_model.config.scaling_factor
+    )
+
+
 class TensorDataset(_Dataset[tuple[torch.Tensor, torch.Tensor]]):
     def __init__(
         self,
         classes: list[tuple[np.uint8, ...]],
         preprocess: Any,
         subset: Subset[Image],
+        autoencoder_model: torch.nn.Module | None = None,
     ):
         self.preprocess = preprocess
+        self.autoencoder_model: Any = autoencoder_model
+        if self.autoencoder_model is not None:
+            self.autoencoder_model = self.autoencoder_model.eval()
+
         self.classes = classes
         self.subset = subset
 
@@ -210,12 +226,15 @@ class TensorDataset(_Dataset[tuple[torch.Tensor, torch.Tensor]]):
         class_label = self.classes.index(
             (*tuple(image.channels), *tuple(image.position))
         )
-        data: npt.NDArray[np.uint8] = self.preprocess(
+        preprocessed_image: npt.NDArray[np.uint8] = self.preprocess(
             image=image.data.transpose(2, 0, 1)
         )
-        return transforms.functional.to_dtype(
-            torch.tensor(data), scale=True
-        ), torch.tensor(class_label)
+        data = transforms.functional.to_dtype(
+            torch.tensor(preprocessed_image), scale=True
+        )
+        if self.autoencoder_model is not None:
+            data = encode(self.autoencoder_model, data)
+        return data, torch.tensor(class_label)
 
 
 # Maybe use StackDataset instead of GoodBadDataset

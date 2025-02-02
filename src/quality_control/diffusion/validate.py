@@ -27,7 +27,7 @@ def validate(
     val_timestep_count: int,
     val_timestep_pruning: int,
 ) -> float:
-    autoencoder_model = autoencoder_model.eval()
+    autoencoder_model = autoencoder_model.eval().to(accelerator.device)
     diffusion_model = diffusion_model.eval()
 
     with torch.no_grad():
