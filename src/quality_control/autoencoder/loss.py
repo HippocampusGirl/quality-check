@@ -1,22 +1,12 @@
-from functools import partial
-from operator import methodcaller
+from dataclasses import dataclass
 from typing import Any
 
 import torch
+from diffusers.configuration_utils import ConfigMixin, register_to_config
+from diffusers.models.modeling_utils import ModelMixin
 from lpips import LPIPS as _LPIPS
-from torch.nn.functional import l1_loss, mse_loss
 
 from ..utils import TrainingState
-from .base import Model
-
-
-def grad(output: torch.Tensor, input: torch.Tensor) -> torch.Tensor:
-    return torch.autograd.grad(
-        outputs=output,
-        inputs=input,
-        grad_outputs=torch.ones_like(output),
-        retain_graph=True,
-    )[0].detach()
 
 
 def is_compiled_module(module: Any) -> bool:
@@ -63,72 +53,92 @@ class LPIPS(torch.nn.Module):
         return loss
 
 
-class JukeboxLoss(torch.nn.Module):
+def get_jukebox_loss(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
     # Adapted from https://github.com/Project-MONAI/MONAI/blob/main/monai/losses/spectral_loss.py#L22
-    def forward(self, *args: torch.Tensor) -> torch.Tensor:
-        fft = map(partial(torch.fft.rfft2, norm="ortho"), args)
-        amplitude = map(methodcaller("abs"), fft)
+    fft_a, fft_b = torch.fft.rfft2(a, norm="ortho"), torch.fft.rfft2(b, norm="ortho")
+    amplitude_a, amplitude_b = fft_a.abs(), fft_b.abs()
 
-        # Compute distance between amplitude of frequency components
-        # See Section 3.3 from https://arxiv.org/abs/2005.00341
-        return mse_loss(*amplitude)
+    # Compute distance between amplitude of frequency components
+    # See Section 3.3 from https://arxiv.org/abs/2005.00341
+    return torch.nn.functional.mse_loss(amplitude_a, amplitude_b)
 
 
-class AutoencoderLoss(torch.nn.Module):
-    def __init__(
-        self,
-        state: TrainingState,
-        autoencoder: Model,
-        discriminator: Model,
-        discriminator_warmup_steps: torch.Tensor,
-        lpips: LPIPS,
-    ):
-        super().__init__()
-        self.state = state
+@dataclass
+class GradNormOutput:
+    reconstructed_images: torch.Tensor
+    values: torch.Tensor
+    weights: torch.Tensor
+    autoencoder_loss: torch.Tensor
+    commit_loss: torch.Tensor
+    grad_norm_loss: torch.Tensor
 
-        self.autoencoder = autoencoder
-        self.discriminator = discriminator
 
+class GradNorm(ModelMixin, ConfigMixin):  # type: ignore
+    @register_to_config  # type: ignore
+    def __init__(self, discriminator_warmup_steps: int, alpha: float = 1.5) -> None:
+        super().__init__()  # type: ignore
         self.discriminator_warmup_steps = discriminator_warmup_steps
-        # self.jukebox_loss = JukeboxLoss()
-        self.lpips = lpips
-
-    def get_adaptive_weight(
-        self, loss: torch.Tensor, discriminator_loss: torch.Tensor
-    ) -> Any:
-        # https://github.com/CompVis/taming-transformers/blob/master/taming/modules/losses/vqperceptual.py
-        decoder_layer = extract_model_from_parallel(
-            self.autoencoder.model
-        ).decoder.conv_out.weight
-        norm_grad_perceptual_loss = grad(loss, decoder_layer).norm(p=2)
-        norm_grad_discriminator_loss = grad(discriminator_loss, decoder_layer).norm(p=2)
-        adaptive_weight = (
-            norm_grad_perceptual_loss / norm_grad_discriminator_loss.clamp(min=1e-4)
-        ).clamp(min=0.0, max=1e4)
-
-        return adaptive_weight
+        self.alpha = alpha
+        self.register_parameter("weights", torch.nn.Parameter(torch.ones(4)))
 
     def forward(
-        self, images: torch.Tensor, reconstructed_images: torch.Tensor
-    ) -> torch.Tensor:
-        images = images.float()
-        reconstructed_images = reconstructed_images.float()
+        self,
+        state: TrainingState,
+        autoencoder_model: torch.nn.Module,
+        discriminator_model: torch.nn.Module,
+        lpips: LPIPS,
+        images: torch.Tensor,
+    ) -> GradNormOutput:
+        reconstructed_images, commit_loss = autoencoder_model(images, return_dict=False)
+        if reconstructed_images is None:
+            raise ValueError
 
-        loss = l1_loss(reconstructed_images, images)
+        l1_loss = torch.nn.functional.l1_loss(reconstructed_images, images)
+        lpips_loss = lpips(reconstructed_images, images).mean()
+        jukebox_loss = get_jukebox_loss(reconstructed_images, images)
+        adversarial_loss = torch.nn.functional.relu(
+            1.0 - discriminator_model(reconstructed_images).mean()
+        )
 
-        perceptual_loss = self.lpips(reconstructed_images, images).mean()
-        # https://github.com/marksgraham/ddpm-ood/blob/main/src/trainers/vqvae_trainer.py#L101
-        loss += 0.001 * perceptual_loss
+        values = torch.stack([l1_loss, lpips_loss, jukebox_loss, adversarial_loss])
 
-        # loss += self.jukebox_loss(reconstructed_images, images)
+        is_warmup = state.step_index < self.discriminator_warmup_steps
+        size = torch.where(is_warmup, 3, 4)
 
-        is_warmup = self.state.step_index < self.discriminator_warmup_steps
-        if not is_warmup:
-            discriminator_loss = torch.nn.functional.relu(
-                1.0 - self.discriminator.model(reconstructed_images).mean()
-            )
-            # https://github.com/marksgraham/ddpm-ood/blob/main/train_vqvae.py#L71
-            weight = self.get_adaptive_weight(loss, discriminator_loss)
-            loss += weight * discriminator_loss
+        values = values[0:size]
+        weights = self.weights[0:size]
 
-        return loss
+        weights = torch.nn.functional.softplus(weights)
+        weights = weights / weights.sum().clamp(min=1e-2) * torch.numel(weights)
+
+        loss = (values * weights.detach()).mean() + commit_loss
+
+        last_layer = extract_model_from_parallel(
+            autoencoder_model
+        ).decoder.conv_out.weight
+
+        def get_grad_norm(value: torch.Tensor) -> Any:
+            return torch.autograd.grad(
+                outputs=value,
+                inputs=last_layer,
+                create_graph=True,
+                retain_graph=True,
+                allow_unused=True,
+                materialize_grads=True,
+            )[0].norm(p=2)
+
+        grad_norms = (
+            torch.stack([get_grad_norm(value) for value in values]).detach() * weights
+        )
+        constant_term = grad_norms.mean() * values.detach().pow(self.alpha)
+
+        grad_norm_loss = torch.nn.functional.l1_loss(grad_norms, constant_term)
+
+        return GradNormOutput(
+            reconstructed_images=reconstructed_images,
+            values=values,
+            weights=weights,
+            autoencoder_loss=loss,
+            commit_loss=commit_loss,
+            grad_norm_loss=grad_norm_loss,
+        )

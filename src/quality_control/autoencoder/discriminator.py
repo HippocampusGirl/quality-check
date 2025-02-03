@@ -68,13 +68,12 @@ def gradient_penalty(
     images: torch.Tensor, output: torch.Tensor, weight: float = 10.0
 ) -> torch.Tensor:
     gradients = torch.autograd.grad(
-        output,
-        images,
+        outputs=output,
+        inputs=images,
         grad_outputs=torch.ones(output.size(), device=images.device),
         create_graph=True,
         retain_graph=True,
         only_inputs=True,
-    )[0]
-    bsz = gradients.shape[0]
-    gradients = torch.reshape(gradients, (bsz, -1))
-    return weight * ((gradients.norm(2, dim=1) - 1) ** 2).mean()  # type: ignore
+    )[0].detach()
+    l2_norm = torch.linalg.vector_norm(gradients, dim=(1, 2, 3))
+    return weight * (l2_norm - 1).pow(2).mean()  # type: ignore

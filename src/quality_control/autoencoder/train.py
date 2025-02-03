@@ -28,7 +28,7 @@ from ..logging import logger
 from ..utils import Timer, TrainingState
 from .base import Model
 from .discriminator import Discriminator, gradient_penalty
-from .loss import LPIPS, AutoencoderLoss
+from .loss import LPIPS, GradNorm, GradNormOutput
 from .model import (
     get_discriminator_model,
     get_learning_rate_scheduler,
@@ -46,31 +46,42 @@ torch.set_float32_matmul_precision("high")
 def epoch(  # noqa: C901
     state: TrainingState,
     accelerator: Accelerator,
-    autoencoder: Model,
-    autoencoder_loss: AutoencoderLoss,
-    discriminator: Model,
+    autoencoder: Model[torch.nn.Module],
+    discriminator: Model[torch.nn.Module],
+    grad_norm: Model[GradNorm],
+    lpips_loss: LPIPS,
     train_dataloader: DataLoader[tuple[torch.Tensor, torch.Tensor]],
     checkpoint: Callable[[], None],
     checkpoint_steps: int,
     validate: Callable[[], None],
     val_steps: int,
+    log_steps: int = 50,
     max_step_count: int | None = None,
 ) -> None:
+    writer = accelerator.get_tracker("tensorboard", unwrap=True)
+
     autoencoder.model = autoencoder.model.train()
     discriminator.model = discriminator.model.train()
+    get_grad_norm_output = partial(
+        grad_norm.model,
+        state,
+        autoencoder.model,
+        discriminator.model,
+        lpips_loss,
+    )
 
     data_timer = Timer()
     model_timer = Timer()
+    log_timer = Timer()
 
     data_timer.start()
 
-    reconstructed_images: torch.Tensor | None = None
-    average_autoencoder_loss: torch.Tensor | None = None
-    average_discriminator_loss: torch.Tensor | None = None
     with (
         tqdm(
             total=len(train_dataloader),
             leave=False,
+            mininterval=1.0,
+            maxinterval=30.0,
             disable=not accelerator.is_main_process,
             unit="steps" + " ",
             position=0,
@@ -78,40 +89,46 @@ def epoch(  # noqa: C901
         accelerator.profile() as profile,
     ):
         progress_bar.set_description(f"Epoch {state.epoch_index.item() + 1}")
+
+        reconstructed_images: torch.Tensor | None = None
         for images, _ in islice(train_dataloader, max_step_count):
-            batch_size = images.size(0)
             images = VaeImageProcessor.normalize(images)
-
             data_timer.stop()
+
             model_timer.start()
-
-            step = state.step_index // accelerator.gradient_accumulation_steps
+            terms: dict[str, torch.Tensor] = dict()
+            step = state.step_index.item() // accelerator.gradient_accumulation_steps
             is_autoencoder_step = (step % 2) == 0
-
             if is_autoencoder_step or reconstructed_images is None:
                 with accelerator.accumulate(autoencoder.model):
-                    (reconstructed_images, commit_loss) = autoencoder.model(
-                        images, return_dict=False
+                    o: GradNormOutput = get_grad_norm_output(images)
+                    accelerator.backward(o.autoencoder_loss)
+                    accelerator.backward(
+                        o.grad_norm_loss, inputs=grad_norm.model.weights
                     )
-                    if reconstructed_images is None:
-                        raise ValueError
-
-                    loss = autoencoder_loss(images, reconstructed_images)
-                    loss += commit_loss
-
-                    average_autoencoder_loss = accelerator.gather(
-                        loss.repeat(batch_size)
-                    ).mean()
-
-                    # with torch._dynamo.compiled_autograd.enable(
-                    #     torch.compile(**accelerator.state.dynamo_plugin.to_kwargs())
-                    # ):
-                    accelerator.backward(loss)
+                    reconstructed_images = o.reconstructed_images
+                    keys = ["l1_loss", "lpips_loss", "jukebox_loss", "adversarial_loss"]
+                    terms = dict(
+                        autoencoder_loss=o.autoencoder_loss,
+                        commit_loss=o.commit_loss,
+                        **{
+                            key: value
+                            for key, value in zip(keys, o.values, strict=False)
+                        },
+                        **{
+                            key.replace("loss", "weight"): weight
+                            for key, weight in zip(keys, o.weights, strict=False)
+                        },
+                        grad_norm_loss=o.grad_norm_loss,
+                    )
 
                     accelerator.clip_grad_norm_(autoencoder.model.parameters(), 1.0)
                     autoencoder.optimizer.step()
+                    grad_norm.optimizer.step()
                     autoencoder.learning_rate_scheduler.step()
+                    grad_norm.learning_rate_scheduler.step()
                 autoencoder.optimizer.zero_grad(set_to_none=True)
+                grad_norm.optimizer.zero_grad(set_to_none=True)
             else:
                 with accelerator.accumulate(discriminator.model):
                     reconstructed_images = reconstructed_images.detach_()
@@ -120,15 +137,18 @@ def epoch(  # noqa: C901
                     images = images.requires_grad_()
                     score = discriminator.model(images)
 
-                    loss = (
+                    hl = (
                         torch.nn.functional.relu(1.0 + reconstructed_score)
                         + torch.nn.functional.relu(1.0 - score)
                     ).mean()
-                    loss += gradient_penalty(score, images)
+                    gp = gradient_penalty(images, score)
 
-                    average_discriminator_loss = accelerator.gather(
-                        loss.repeat(batch_size)
-                    ).mean()
+                    loss = hl + gp
+                    terms = dict(
+                        discriminator_hinge_loss=hl,
+                        discriminator_gradient_penalty=gp,
+                        discriminator_loss=loss,
+                    )
 
                     accelerator.backward(loss)
                     accelerator.clip_grad_norm_(discriminator.model.parameters(), 1.0)
@@ -138,30 +158,45 @@ def epoch(  # noqa: C901
 
             model_timer.stop()
 
-            progress_bar.update(1)
-            if state.step_index != 0:
-                if accelerator.sync_gradients and accelerator.is_main_process:
-                    learning_rate = autoencoder.learning_rate_scheduler.get_last_lr()[0]
-                    logs = dict(
-                        learning_rate=learning_rate,
-                        epoch=state.epoch_index.item(),
-                        data_time=data_timer.value,
-                        model_time=model_timer.value,
-                    )
-                    progress_bar.set_postfix(**logs)
-                    if average_autoencoder_loss is not None:
-                        logs["autoencoder_train_loss"] = average_autoencoder_loss.item()
-                        average_autoencoder_loss = None
-                    if average_discriminator_loss is not None:
-                        logs["discriminator_train_loss"] = (
-                            average_discriminator_loss.item()
-                        )
-                        average_discriminator_loss = None
-                    accelerator.log(logs, step=state.step_index.item())
+            if progress_bar.n < 10:
+                model_timer.reset()
+                data_timer.reset()
+                log_timer.reset()
 
-                    if state.step_index % checkpoint_steps == 0:
-                        checkpoint()
-                if state.step_index % val_steps == 0:
+            progress_bar.update(1)
+            if step != 0:
+                if (step % log_steps) in {0, 1}:
+                    log_timer.start()
+                    terms = accelerator.reduce(terms, reduction="mean")
+                    if accelerator.sync_gradients and accelerator.is_main_process:
+                        learning_rate = (
+                            autoencoder.learning_rate_scheduler.get_last_lr()[0]
+                        )
+                        logs = dict(
+                            learning_rate=learning_rate,
+                            epoch=state.epoch_index.item(),
+                            data_time=data_timer.value,
+                            model_time=model_timer.value,
+                            log_time=log_timer.value,
+                        )
+                        progress_bar.set_postfix(**logs, refresh=False)
+                        logs.update(
+                            {
+                                f"train_{key}": value.item()
+                                for key, value in terms.items()
+                            }
+                        )
+                        for key, value in logs.items():
+                            writer.add_scalar(key, value, global_step=step)
+                    log_timer.stop()
+
+                if (
+                    (step % checkpoint_steps) == 0
+                    and accelerator.sync_gradients
+                    and accelerator.is_main_process
+                ):
+                    checkpoint()
+                if (step % val_steps) == 0:
                     validate()
             state.step_index += 1
 
@@ -185,11 +220,11 @@ class Trainer:
 
     is_profile: bool = False
 
-    val_steps: int = 100
+    val_steps: int = 200
     val_count: int = 50
-    checkpoint_steps: int = 500
+    checkpoint_steps: int = 1000
     # https://github.com/CompVis/taming-transformers/issues/93
-    discriminator_warmup_steps: int = 10000
+    discriminator_warmup_steps: int = 30000
 
     artifact_path: Path = field(init=False)
     accelerator: Accelerator = field(init=False)
@@ -202,7 +237,6 @@ class Trainer:
         self.checkpoint_prefix = f"{prefix}_step-"
         self.artifact_path = self.datastore.cache_path
 
-        fullgraph: bool = True
         mixed_precision = "bf16"
         kwargs_handlers: list[Any] = list()
         # mixed_precision = "fp8"
@@ -242,6 +276,9 @@ class Trainer:
                 )
             )
 
+        fullgraph: bool = True
+        torch._dynamo.config.compiled_autograd = True
+
         logger.info(f"{torch.cuda.device_count()=}")
         local_rank = os.environ.get("LOCAL_RANK")
         if local_rank is not None:
@@ -266,7 +303,7 @@ class Trainer:
             fsdp_plugin=fsdp_plugin,
             kwargs_handlers=kwargs_handlers,
             log_with=TensorBoardTracker(
-                run_name=str(time_ns()), logging_dir=tensorboard_path
+                run_name=str(time_ns()), logging_dir=tensorboard_path, max_queue=0
             ),
         )
 
@@ -285,15 +322,13 @@ class Trainer:
 
     def train(
         self,
-        # trial: optuna.trial.Trial,
-        autoencoder: Model,
-        discriminator: Model,
+        state: TrainingState,
+        autoencoder: Model[torch.nn.Module],
+        discriminator: Model[torch.nn.Module],
+        grad_norm: Model[GradNorm],
         train_dataloader: DataLoader[tuple[torch.Tensor, torch.Tensor]],
         val_dataloader: DataLoader[tuple[torch.Tensor, torch.Tensor, torch.Tensor]],
     ) -> None:
-        state = TrainingState()
-        self.accelerator.register_for_checkpointing(state)
-
         checkpoints = list(self.artifact_path.glob(f"{self.checkpoint_prefix}*"))
         checkpoints.sort(
             key=lambda path: int(path.stem.removeprefix(self.checkpoint_prefix)),
@@ -304,30 +339,23 @@ class Trainer:
             self.accelerator.load_state(latest_checkpoint)
             logger.info(f"Resuming from {state.epoch_index=} {state.step_index=}")
 
+        lpips_loss: Any = LPIPS().to(self.accelerator.device)
+        lpips_loss = torch.compile(
+            lpips_loss, **self.accelerator.state.dynamo_plugin.to_kwargs()
+        )
+
         def val_iterator() -> Iterator[tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
             while True:
                 yield from val_dataloader
-
-        lpips: Any = LPIPS().to(self.accelerator.device)
-        lpips = torch.compile(lpips, **self.accelerator.state.dynamo_plugin.to_kwargs())
-        autoencoder_loss: Any = AutoencoderLoss(
-            state=state,
-            autoencoder=autoencoder,
-            discriminator=discriminator,
-            discriminator_warmup_steps=torch.tensor(self.discriminator_warmup_steps),
-            lpips=lpips,
-        ).to(self.accelerator.device)
-        # autoencoder_loss = torch.compile(
-        #     autoencoder_loss, **self.accelerator.state.dynamo_plugin.to_kwargs()
-        # )
 
         for _ in range(self.epoch_count):
             epoch(
                 state=state,
                 accelerator=self.accelerator,
                 autoencoder=autoencoder,
-                autoencoder_loss=autoencoder_loss,
                 discriminator=discriminator,
+                lpips_loss=lpips_loss,
+                grad_norm=grad_norm,
                 train_dataloader=train_dataloader,
                 checkpoint=partial(self.checkpoint, state=state),
                 checkpoint_steps=self.checkpoint_steps,
@@ -350,15 +378,27 @@ class Trainer:
         self.accelerator.end_training()
 
     def run(self) -> None:
+        state = TrainingState()
+        self.accelerator.register_for_checkpointing(state)
+
         channel_count = self.data_module_class.channel_count
+
         autoencoder_model = get_model(channel_count)
-        logger.info(f"{autoencoder_model.num_parameters()=}")
         autoencoder_optimizer = bitsandbytes.optim.Lion(
             autoencoder_model.parameters(), optim_bits=32
         )
+
         discriminator_model = get_discriminator_model(channel_count)
         discriminator_optimizer = bitsandbytes.optim.AdamW(
             discriminator_model.parameters(), optim_bits=32
+        )
+
+        grad_norm_model = GradNorm(
+            discriminator_warmup_steps=self.discriminator_warmup_steps
+        )
+        self.accelerator.register_for_checkpointing(grad_norm_model)
+        grad_norm_optimizer = bitsandbytes.optim.AdamW(
+            grad_norm_model.parameters(), optim_bits=32
         )
 
         def save_model_hook(
@@ -410,19 +450,28 @@ class Trainer:
         train_dataloader = data_module.train_dataloader()
         val_dataloader = data_module.val_dataloader()
 
+        logger.info(f"{autoencoder_model.num_parameters()=}")
+
+        learning_rate_scheduler_factory = partial(
+            get_learning_rate_scheduler,
+            train_dataloader=train_dataloader,
+            epoch_count=self.epoch_count,
+        )
+
         autoencoder = Model(
             autoencoder_model,
             autoencoder_optimizer,
-            get_learning_rate_scheduler(
-                autoencoder_optimizer, train_dataloader, self.epoch_count
-            ),
+            learning_rate_scheduler_factory(autoencoder_optimizer),
         )
         discriminator = Model(
             discriminator_model,
             discriminator_optimizer,
-            get_learning_rate_scheduler(
-                discriminator_optimizer, train_dataloader, self.epoch_count
-            ),
+            learning_rate_scheduler_factory(discriminator_optimizer),
+        )
+        grad_norm = Model(
+            grad_norm_model.to(self.accelerator.device),
+            grad_norm_optimizer,
+            learning_rate_scheduler_factory(grad_norm_optimizer),
         )
 
         (
@@ -432,6 +481,9 @@ class Trainer:
             discriminator.model,
             discriminator.optimizer,
             discriminator.learning_rate_scheduler,
+            # grad_norm.model,
+            grad_norm.optimizer,
+            grad_norm.learning_rate_scheduler,
             train_dataloader,
             val_dataloader,
         ) = self.accelerator.prepare(
@@ -441,13 +493,18 @@ class Trainer:
             discriminator.model,
             discriminator.optimizer,
             discriminator.learning_rate_scheduler,
+            # grad_norm.model,
+            grad_norm.optimizer,
+            grad_norm.learning_rate_scheduler,
             train_dataloader,
             val_dataloader,
         )
 
         self.train(
+            state,
             autoencoder,
             discriminator,
+            grad_norm,
             train_dataloader,
             val_dataloader,
         )

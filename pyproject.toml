@@ -33,6 +33,7 @@ pip = "*"
 
 matplotlib = "*"
 numpy = "*"
+opt-einsum = "*"
 pandas = "*"
 scipy = "*"
 tqdm = "*"

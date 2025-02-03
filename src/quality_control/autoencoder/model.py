@@ -5,7 +5,7 @@ from ..diffusion.model import get_learning_rate_scheduler as get_learning_rate_s
 from .discriminator import Discriminator
 
 model_class = VQModel
-model_name = "f4a"
+model_name = "f4g"
 
 image_size: int = 256
 
@@ -42,6 +42,7 @@ def get_model(channel_count: int) -> torch.nn.Module:
             "UpDecoderBlock2D",
         ],
     )
+    model.quantize.legacy = False  # type: ignore
     return model  # type: ignore
 
 

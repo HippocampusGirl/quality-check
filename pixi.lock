@@ -388,6 +388,7 @@ environments:
       - conda: https://conda.anaconda.org/conda-forge/linux-64/openjpeg-2.5.3-h5fbd93e_0.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-64/openldap-2.6.9-he970967_0.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-64/openssl-3.4.0-h7b32b05_1.conda
+      - conda: https://conda.anaconda.org/conda-forge/noarch/opt-einsum-3.4.0-hd8ed1ab_1.conda
       - conda: https://conda.anaconda.org/conda-forge/noarch/opt_einsum-3.4.0-pyhd8ed1ab_1.conda
       - conda: https://conda.anaconda.org/conda-forge/noarch/optuna-4.1.0-pyhd8ed1ab_1.conda
       - conda: https://conda.anaconda.org/conda-forge/noarch/optuna-integration-4.2.1-pyhd8ed1ab_0.conda
@@ -7253,9 +7254,9 @@ packages:
   timestamp: 1733741040117
 - kind: pypi
   name: machine-learning
-  version: 0.0.post1.dev24+g769764a.d20250201
+  version: 0.0.post1.dev25+g4a6afb6.d20250202
   path: .
-  sha256: ef5f67262147c37a55bf32f04393cbde882147b56d26d1166070810b2d6194e6
+  sha256: cfa10da9652e150d2c99cb7d57ad9d1ca70cf6269ac8c1c64b4b7a4d8fc91843
   requires_python: '>=3.12'
   editable: true
 - kind: conda
@@ -8103,6 +8104,23 @@ packages:
   purls: []
   size: 2937158
   timestamp: 1736086387286
+- kind: conda
+  name: opt-einsum
+  version: 3.4.0
+  build: hd8ed1ab_1
+  build_number: 1
+  subdir: noarch
+  noarch: generic
+  url: https://conda.anaconda.org/conda-forge/noarch/opt-einsum-3.4.0-hd8ed1ab_1.conda
+  sha256: 8db3d841c72f184de69e1237b900a2d79c742e30e8378973814543bf987b6bc6
+  md5: b94f689d8b1ce7dd212946e0331037ad
+  depends:
+  - opt_einsum >=3.4.0,<3.4.1.0a0
+  license: MIT
+  license_family: MIT
+  purls: []
+  size: 6558
+  timestamp: 1733688054327
 - kind: conda
   name: opt_einsum
   version: 3.4.0

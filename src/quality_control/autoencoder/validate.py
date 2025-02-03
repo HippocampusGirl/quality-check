@@ -57,7 +57,7 @@ def validate(
 
     logs = dict(
         epoch=state.epoch_index.item(),
-        autoencoder_val_loss=numerator / val_count,
+        val_autoencoder_loss=numerator / val_count,
     )
 
     if accelerator.is_main_process:
