@@ -14,6 +14,7 @@ from accelerate.tracking import TensorBoardTracker
 from accelerate.utils import (
     DDPCommunicationHookType,
     DistributedDataParallelKwargs,
+    # FP8RecipeKwargs,
     FullyShardedDataParallelPlugin,
     ProfileKwargs,
     TorchDynamoPlugin,
@@ -237,15 +238,8 @@ class Trainer:
         self.checkpoint_prefix = f"{prefix}_step-"
         self.artifact_path = self.datastore.cache_path
 
-        mixed_precision = "bf16"
         kwargs_handlers: list[Any] = list()
-        # mixed_precision = "fp8"
-        # if mixed_precision == "fp8":
-        #     fullgraph = False
-        #     fp8_recipe_kwargs = FP8RecipeKwargs(backend="te", fp8_format="HYBRID")
-        #     kwargs_handlers.append(fp8_recipe_kwargs)
         fsdp_plugin: FullyShardedDataParallelPlugin | None = None
-        # deepspeed_plugin: DeepSpeedPlugin
 
         if self.is_profile:
             output_trace_dir = self.artifact_path / f"{prefix}_profile"
@@ -285,10 +279,15 @@ class Trainer:
             fullgraph = False
             torch.cuda.set_device(int(local_rank))
             kwargs_handlers.append(
-                DistributedDataParallelKwargs(
-                    comm_hook=DDPCommunicationHookType[mixed_precision.upper()]
-                )
+                DistributedDataParallelKwargs(comm_hook=DDPCommunicationHookType.BF16)
             )
+
+        mixed_precision = "bf16"
+        # mixed_precision = "fp8"
+        # if mixed_precision == "fp8":
+        #     fullgraph = False
+        #     fp8_recipe_kwargs = FP8RecipeKwargs(backend="te", fp8_format="HYBRID")
+        #     kwargs_handlers.append(fp8_recipe_kwargs)
 
         tensorboard_path = self.artifact_path / f"{prefix}_tensorboard"
         tensorboard_path.mkdir(parents=True, exist_ok=True)

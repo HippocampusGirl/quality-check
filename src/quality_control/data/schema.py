@@ -41,6 +41,7 @@ class Datastore(AbstractContextManager[None]):
         connection = sqlite3.connect(self.database_uri, autocommit=False, uri=True)
         with connection:
             cursor = connection.cursor()
+            cursor.execute(f"PRAGMA mmap_size = {1 << 40}")
             cursor.execute(
                 """
                 CREATE TABLE IF NOT EXISTS string (

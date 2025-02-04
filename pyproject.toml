@@ -25,8 +25,12 @@ cuda = "12"
 [tool.pixi.tasks]
 post-install = "pip install 'transformer_engine[pytorch]'"
 
+[tool.pixi.pypi-options]
+no-build-isolation = ["transformer-engine-torch"]
+
 [tool.pixi.pypi-dependencies]
 machine-learning = { path = ".", editable = true }
+transformer-engine = { version = "*", extras = ["pytorch"] }
 
 [tool.pixi.dependencies]
 pip = "*"
@@ -62,7 +66,7 @@ c-compiler = "*"
 cxx-compiler = "*"
 
 # nvidia
-cuda-version = "12.6"
+cuda-version = ">=12.6"
 cuda-nvrtc-dev = "*"
 cuda-nvtx-dev = "*"
 libcublas-dev = "*"
