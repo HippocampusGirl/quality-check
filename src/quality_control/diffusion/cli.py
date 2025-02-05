@@ -94,6 +94,10 @@ def run_train(
             is_profile=arguments.profile,
         )
 
+        import torch
+
+        torch.multiprocessing.set_sharing_strategy("file_system")  # type: ignore
+
         import optuna
         from optuna.storages import RetryFailedTrialCallback
 

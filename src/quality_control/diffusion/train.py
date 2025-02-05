@@ -17,6 +17,7 @@ from accelerate import Accelerator
 from accelerate.utils import (
     DDPCommunicationHookType,
     DistributedDataParallelKwargs,
+    FP8RecipeKwargs,
     FullyShardedDataParallelPlugin,
     ProfileKwargs,
     TorchDynamoPlugin,
@@ -192,12 +193,6 @@ class Trainer:
     )
 
     def __post_init__(self) -> None:
-        parameter_count = self.autoencoder_model.num_parameters()
-        memory_footprint: float = (
-            self.autoencoder_model.get_memory_footprint(return_buffers=True) / 1e9
-        )
-        logger.info(f"autoencoder_model {memory_footprint=} {parameter_count=}")
-
         data_module = self.data_module_class(
             self.datastore,
             generator=torch.Generator(device="cpu").manual_seed(self.seed),
@@ -214,16 +209,7 @@ class Trainer:
             raise ValueError("Datastore cache path is None")
         self.artifact_path = self.datastore.cache_path
 
-        fullgraph: bool = True
-        mixed_precision = "bf16"
         kwargs_handlers: list[Any] = list()
-        # mixed_precision = "fp8"
-        # if mixed_precision == "fp8":
-        #     fullgraph = False
-        #     fp8_recipe_kwargs = FP8RecipeKwargs(backend="te", fp8_format="HYBRID")
-        #     kwargs_handlers.append(fp8_recipe_kwargs)
-        fsdp_plugin: FullyShardedDataParallelPlugin | None = None
-        # deepspeed_plugin: DeepSpeedPlugin
 
         if self.is_profile:
             prefix = f"dataset-{self.datastore.name}_model-diffusion"
@@ -255,15 +241,21 @@ class Trainer:
                 )
             )
 
+        fullgraph: bool = True
+        mixed_precision: str = "bf16"
+        if mixed_precision == "fp8":
+            fullgraph = False
+            fp8_recipe_kwargs = FP8RecipeKwargs(backend="te", fp8_format="HYBRID")
+            kwargs_handlers.append(fp8_recipe_kwargs)
+        fsdp_plugin: FullyShardedDataParallelPlugin | None = None
+
         cuda_device_count = torch.cuda.device_count()
         logger.info(f"{torch.cuda.device_count()=}")
         if cuda_device_count > 1:
             fullgraph = False
             torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
             kwargs_handlers.append(
-                DistributedDataParallelKwargs(
-                    comm_hook=DDPCommunicationHookType[mixed_precision.upper()]
-                )
+                DistributedDataParallelKwargs(comm_hook=DDPCommunicationHookType.BF16)
             )
 
         self.accelerator = Accelerator(
@@ -349,6 +341,7 @@ class Trainer:
                 yield from val_dataloader
 
         lpips: Any = LPIPS().to(self.accelerator.device)
+        lpips = torch.compile(lpips, **self.accelerator.state.dynamo_plugin.to_kwargs())
 
         epochs = list(range(int(state.epoch_index.item()), self.epoch_count))
         for _ in tqdm(
@@ -407,15 +400,15 @@ class Trainer:
         diffusion_model = get_model(
             trial, image_size // factor, channel_count, class_count
         )
-        parameter_count = diffusion_model.num_parameters()
+        parameter_count = diffusion_model.num_parameters()  # type: ignore
         memory_footprint: float = (
-            diffusion_model.get_memory_footprint(return_buffers=True) / 1e9
+            diffusion_model.get_memory_footprint(return_buffers=True) / 1e9  # type: ignore
         )
         logger.info(f"diffusion_model {memory_footprint=} {parameter_count=}")
         if memory_footprint > 10:
             trial.set_user_attr("constraint", (0.0, 1.0))
             return -1.0
-        optimizer = bitsandbytes.optim.Lion8bit(diffusion_model.parameters())
+        optimizer = bitsandbytes.optim.Lion(diffusion_model.parameters(), optim_bits=32)
         learning_rate_scheduler = get_learning_rate_scheduler(
             optimizer, self.train_dataloader, self.epoch_count
         )

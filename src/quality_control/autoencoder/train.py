@@ -14,6 +14,7 @@ from accelerate.tracking import TensorBoardTracker
 from accelerate.utils import (
     DDPCommunicationHookType,
     DistributedDataParallelKwargs,
+    DynamoBackend,
     # FP8RecipeKwargs,
     FullyShardedDataParallelPlugin,
     ProfileKwargs,
@@ -28,7 +29,7 @@ from ..data.schema import Datastore
 from ..logging import logger
 from ..utils import Timer, TrainingState
 from .base import Model
-from .discriminator import Discriminator, gradient_penalty
+from .discriminator import Discriminator, gradient_penalty, random_weighted_average
 from .loss import LPIPS, GradNorm, GradNormOutput
 from .model import (
     get_discriminator_model,
@@ -49,6 +50,7 @@ def epoch(  # noqa: C901
     accelerator: Accelerator,
     autoencoder: Model[torch.nn.Module],
     discriminator: Model[torch.nn.Module],
+    discriminator_warmup_steps: int,
     grad_norm: Model[GradNorm],
     lpips_loss: LPIPS,
     train_dataloader: DataLoader[tuple[torch.Tensor, torch.Tensor]],
@@ -65,7 +67,6 @@ def epoch(  # noqa: C901
     discriminator.model = discriminator.model.train()
     get_grad_norm_output = partial(
         grad_norm.model,
-        state,
         autoencoder.model,
         discriminator.model,
         lpips_loss,
@@ -89,7 +90,8 @@ def epoch(  # noqa: C901
         ) as progress_bar,
         accelerator.profile() as profile,
     ):
-        progress_bar.set_description(f"Epoch {state.epoch_index.item() + 1}")
+        epoch = state.epoch_index.item()
+        progress_bar.set_description(f"Epoch {epoch + 1}")
 
         reconstructed_images: torch.Tensor | None = None
         for images, _ in islice(train_dataloader, max_step_count):
@@ -102,11 +104,10 @@ def epoch(  # noqa: C901
             is_autoencoder_step = (step % 2) == 0
             if is_autoencoder_step or reconstructed_images is None:
                 with accelerator.accumulate(autoencoder.model):
-                    o: GradNormOutput = get_grad_norm_output(images)
+                    is_warmup = step <= discriminator_warmup_steps
+                    o: GradNormOutput = get_grad_norm_output(is_warmup, images)
                     accelerator.backward(o.autoencoder_loss)
-                    accelerator.backward(
-                        o.grad_norm_loss, inputs=grad_norm.model.weights
-                    )
+                    accelerator.backward(o.grad_norm_loss)
                     reconstructed_images = o.reconstructed_images
                     keys = ["l1_loss", "lpips_loss", "jukebox_loss", "adversarial_loss"]
                     terms = dict(
@@ -132,17 +133,19 @@ def epoch(  # noqa: C901
                 grad_norm.optimizer.zero_grad(set_to_none=True)
             else:
                 with accelerator.accumulate(discriminator.model):
-                    reconstructed_images = reconstructed_images.detach_()
-                    reconstructed_score = discriminator.model(reconstructed_images)
+                    reconstructed_images.detach_()
 
-                    images = images.requires_grad_()
+                    reconstructed_score = discriminator.model(reconstructed_images)
                     score = discriminator.model(images)
 
                     hl = (
-                        torch.nn.functional.relu(1.0 + reconstructed_score)
-                        + torch.nn.functional.relu(1.0 - score)
-                    ).mean()
-                    gp = gradient_penalty(images, score)
+                        torch.nn.functional.relu(1.0 + reconstructed_score).mean()
+                        + torch.nn.functional.relu(1.0 - score).mean()
+                    ) / 2.0
+
+                    rwa = random_weighted_average(images, reconstructed_images)
+                    rwa.requires_grad_()
+                    gp = gradient_penalty(discriminator.model(rwa).mean(), rwa)
 
                     loss = hl + gp
                     terms = dict(
@@ -175,7 +178,7 @@ def epoch(  # noqa: C901
                         )
                         logs = dict(
                             learning_rate=learning_rate,
-                            epoch=state.epoch_index.item(),
+                            epoch=epoch,
                             data_time=data_timer.value,
                             model_time=model_timer.value,
                             log_time=log_timer.value,
@@ -225,7 +228,7 @@ class Trainer:
     val_count: int = 50
     checkpoint_steps: int = 1000
     # https://github.com/CompVis/taming-transformers/issues/93
-    discriminator_warmup_steps: int = 30000
+    discriminator_warmup_steps: int = 250000
 
     artifact_path: Path = field(init=False)
     accelerator: Accelerator = field(init=False)
@@ -270,13 +273,13 @@ class Trainer:
                 )
             )
 
-        fullgraph: bool = True
-        torch._dynamo.config.compiled_autograd = True
+        torch._dynamo.config.compiled_autograd = (
+            False  # compiled_autograd does not support create_graph
+        )
 
         logger.info(f"{torch.cuda.device_count()=}")
         local_rank = os.environ.get("LOCAL_RANK")
         if local_rank is not None:
-            fullgraph = False
             torch.cuda.set_device(int(local_rank))
             kwargs_handlers.append(
                 DistributedDataParallelKwargs(comm_hook=DDPCommunicationHookType.BF16)
@@ -296,8 +299,7 @@ class Trainer:
             mixed_precision=mixed_precision,
             gradient_accumulation_steps=self.gradient_accumulation_steps,
             dynamo_plugin=TorchDynamoPlugin(
-                backend="inductor",
-                fullgraph=fullgraph,  # mode="reduce-overhead"
+                backend=DynamoBackend.INDUCTOR, fullgraph=False
             ),
             fsdp_plugin=fsdp_plugin,
             kwargs_handlers=kwargs_handlers,
@@ -353,6 +355,7 @@ class Trainer:
                 accelerator=self.accelerator,
                 autoencoder=autoencoder,
                 discriminator=discriminator,
+                discriminator_warmup_steps=self.discriminator_warmup_steps,
                 lpips_loss=lpips_loss,
                 grad_norm=grad_norm,
                 train_dataloader=train_dataloader,
@@ -405,9 +408,10 @@ class Trainer:
         ) -> None:
             output_path = Path(output_dir)
             if self.accelerator.is_main_process:
-                autoencoder_model, discriminator_model = models
+                autoencoder_model, discriminator_model, grad_norm_model = models
                 autoencoder_model.save_pretrained(output_path / "autoencoder")
                 discriminator_model.save_pretrained(output_path / "discriminator")
+                grad_norm_model.save_pretrained(output_path / "grad-norm")
                 weights.pop()
                 weights.pop()
 
@@ -415,25 +419,19 @@ class Trainer:
             models: list[torch.nn.Module], input_dir: Path | str
         ) -> None:
             input_path = Path(input_dir)
-            discriminator_model = models.pop()
-            pretrained_discriminator_model = Discriminator.from_pretrained(
-                input_path, subfolder="discriminator"
-            )
-            discriminator_model.register_to_config(
-                **pretrained_discriminator_model.config
-            )
-            discriminator_model.load_state_dict(
-                pretrained_discriminator_model.state_dict()
-            )
-            del pretrained_discriminator_model
 
-            autoencoder_model = models.pop()
-            pretrained_autoencoder_model = model_class.from_pretrained(
-                input_path, subfolder="autoencoder"
-            )
-            autoencoder_model.register_to_config(**pretrained_autoencoder_model.config)
-            autoencoder_model.load_state_dict(pretrained_autoencoder_model.state_dict())
-            del pretrained_autoencoder_model
+            def load_model(model_class: Type[Any], subfolder: str) -> None:
+                model = models.pop()
+                loaded_model = model_class.from_pretrained(
+                    input_path, subfolder=subfolder
+                )
+                model.register_to_config(**loaded_model.config)
+                model.load_state_dict(loaded_model.state_dict())
+                del loaded_model
+
+            load_model(GradNorm, "grad-norm")
+            load_model(Discriminator, "discriminator")
+            load_model(model_class, "autoencoder")
 
         self.accelerator.register_save_state_pre_hook(save_model_hook)
         self.accelerator.register_load_state_pre_hook(load_model_hook)
@@ -480,7 +478,6 @@ class Trainer:
             discriminator.model,
             discriminator.optimizer,
             discriminator.learning_rate_scheduler,
-            # grad_norm.model,
             grad_norm.optimizer,
             grad_norm.learning_rate_scheduler,
             train_dataloader,
@@ -492,12 +489,16 @@ class Trainer:
             discriminator.model,
             discriminator.optimizer,
             discriminator.learning_rate_scheduler,
-            # grad_norm.model,
             grad_norm.optimizer,
             grad_norm.learning_rate_scheduler,
             train_dataloader,
             val_dataloader,
         )
+
+        dynamo_backend = self.accelerator.state.dynamo_plugin.backend
+        self.accelerator.state.dynamo_plugin.backend = DynamoBackend.NO
+        grad_norm.model = self.accelerator.prepare_model(grad_norm.model)
+        self.accelerator.state.dynamo_plugin.backend = dynamo_backend
 
         self.train(
             state,

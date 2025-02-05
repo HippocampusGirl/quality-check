@@ -6,8 +6,6 @@ from diffusers.configuration_utils import ConfigMixin, register_to_config
 from diffusers.models.modeling_utils import ModelMixin
 from lpips import LPIPS as _LPIPS
 
-from ..utils import TrainingState
-
 
 def is_compiled_module(module: Any) -> bool:
     return isinstance(module, torch._dynamo.eval_frame.OptimizedModule)
@@ -83,10 +81,10 @@ class GradNorm(ModelMixin, ConfigMixin):  # type: ignore
 
     def forward(
         self,
-        state: TrainingState,
         autoencoder_model: torch.nn.Module,
         discriminator_model: torch.nn.Module,
         lpips: LPIPS,
+        is_warmup: bool,
         images: torch.Tensor,
     ) -> GradNormOutput:
         reconstructed_images, commit_loss = autoencoder_model(images, return_dict=False)
@@ -97,22 +95,28 @@ class GradNorm(ModelMixin, ConfigMixin):  # type: ignore
         lpips_loss = lpips(reconstructed_images, images).mean()
         jukebox_loss = get_jukebox_loss(reconstructed_images, images)
         adversarial_loss = torch.nn.functional.relu(
-            1.0 - discriminator_model(reconstructed_images).mean()
+            1.0 - discriminator_model(reconstructed_images)
+        ).mean()
+
+        value_list = [l1_loss, lpips_loss, jukebox_loss]
+        if not is_warmup:
+            value_list.append(adversarial_loss)
+        values = torch.stack(value_list)
+
+        weights = self.weights[0 : torch.numel(values)]
+        # enforce a minimum and maximum value for the weights
+        weights = torch.nn.functional.hardtanh(weights, min_val=1e-1, max_val=1e4)
+        # ensure that the sum of the weights is greater or equal to the number of losses
+        weights *= torch.nn.functional.threshold(
+            torch.numel(weights) / weights.sum(),
+            threshold=1.0,
+            value=1.0,
         )
 
-        values = torch.stack([l1_loss, lpips_loss, jukebox_loss, adversarial_loss])
-
-        is_warmup = state.step_index < self.discriminator_warmup_steps
-        size = torch.where(is_warmup, 3, 4)
-
-        values = values[0:size]
-        weights = self.weights[0:size]
-
-        weights = torch.nn.functional.softplus(weights)
-        weights = weights / weights.sum().clamp(min=1e-2) * torch.numel(weights)
-
+        # get autoencoder loss
         loss = (values * weights.detach()).mean() + commit_loss
 
+        # get gradnorm loss for last layer
         last_layer = extract_model_from_parallel(
             autoencoder_model
         ).decoder.conv_out.weight
@@ -130,9 +134,12 @@ class GradNorm(ModelMixin, ConfigMixin):  # type: ignore
         grad_norms = (
             torch.stack([get_grad_norm(value) for value in values]).detach() * weights
         )
-        constant_term = grad_norms.mean() * values.detach().pow(self.alpha)
 
-        grad_norm_loss = torch.nn.functional.l1_loss(grad_norms, constant_term)
+        rates = (values / values.mean()).detach()
+        grad_norm_loss = torch.nn.functional.l1_loss(
+            grad_norms,
+            grad_norms.mean() * rates.pow(self.alpha),
+        )
 
         return GradNormOutput(
             reconstructed_images=reconstructed_images,

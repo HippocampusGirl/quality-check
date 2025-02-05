@@ -5,7 +5,7 @@ from ..diffusion.model import get_learning_rate_scheduler as get_learning_rate_s
 from .discriminator import Discriminator
 
 model_class = VQModel
-model_name = "f4g"
+model_name = "f4u"
 
 image_size: int = 256
 

@@ -70,6 +70,7 @@ num_threads_variables: Sequence[str] = [
     "NUMEXPR_MAX_THREADS",
     "NPROC",
     "OPENCV_FFMPEG_THREADS",
+    "TORCHINDUCTOR_COMPILE_THREADS",
 ]
 
 

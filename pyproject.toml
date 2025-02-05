@@ -1,7 +1,7 @@
 [project]
 name = "machine-learning"
 dynamic = ["version"]
-requires-python = ">=3.12"
+requires-python = "==3.12"
 dependencies = []
 
 [project.scripts]
@@ -22,22 +22,18 @@ platforms = ["linux-64"]
 linux = "4.18"
 cuda = "12"
 
-[tool.pixi.tasks]
-post-install = "pip install 'transformer_engine[pytorch]'"
-
 [tool.pixi.pypi-options]
 no-build-isolation = ["transformer-engine-torch"]
 
 [tool.pixi.pypi-dependencies]
 machine-learning = { path = ".", editable = true }
-transformer-engine = { version = "*", extras = ["pytorch"] }
+# transformer-engine = { version = "*", extras = ["pytorch"] }
 
 [tool.pixi.dependencies]
 pip = "*"
 
 matplotlib = "*"
 numpy = "*"
-opt-einsum = "*"
 pandas = "*"
 scipy = "*"
 tqdm = "*"
@@ -45,6 +41,7 @@ cairosvg = "*"
 types-pillow = "*"
 
 psycopg2 = "*"
+redis-py = "*"
 sqlite = ">=3.46.0"
 zstandard = "*"
 
@@ -62,6 +59,7 @@ fvcore = "*"
 iopath = "*"
 torchvision = "*"
 triton = "*"
+
 c-compiler = "*"
 cxx-compiler = "*"
 
@@ -75,8 +73,8 @@ libcusparse-dev = "*"
 
 albumentations = "*"
 bitsandbytes = { version = "*", build = "*cuda*" }
-deepspeed = "*"
-lightning = "*"
+# deepspeed = "*"
+# lightning = "*"
 lpips = "*"
 monai = "*"
 optuna = "<4.2"

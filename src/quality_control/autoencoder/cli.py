@@ -49,9 +49,6 @@ def run_train(
         for c_flag in os.environ["CFLAGS"].split()
         if c_flag.startswith("-I")
     )
-    cache_path = Path(arguments.artifact_store_path) / "cache"
-    cache_path.mkdir(parents=True, exist_ok=True)
-    os.environ["TORCHINDUCTOR_CACHE_DIR"] = str(cache_path)
 
     from ..logging import logger
 

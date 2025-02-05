@@ -1,3 +1,4 @@
+import multiprocessing as mp
 import random
 from functools import partial
 from typing import Any, Callable, ClassVar, Sequence, TypeAlias
@@ -8,7 +9,6 @@ import numpy as np
 import torch
 import torchvision.transforms.v2 as transforms
 from diffusers.image_processor import VaeImageProcessor
-from lightning.pytorch import LightningDataModule
 from numpy import typing as npt
 from torch.utils.data import (
     ConcatDataset,
@@ -28,6 +28,9 @@ from .dataset import (
     get_channels,
 )
 from .schema import Datastore
+
+multiprocessing_context = mp.get_context("forkserver")
+multiprocessing_context.set_forkserver_preload(["quality_control.data.datamodule"])
 
 
 def worker_init(worker_id: int) -> None:
@@ -65,7 +68,7 @@ def get_weights(datasets: Sequence[ImageDataset]) -> npt.NDArray[np.float32]:
     return np.array(weights)
 
 
-class BaseDataModule(LightningDataModule):
+class BaseDataModule:
     classes: list[tuple[np.uint8, ...]]
 
     channel_count: ClassVar[int]
@@ -149,6 +152,9 @@ class BaseDataModule(LightningDataModule):
             drop_last=True,
             generator=self.generator,
             num_workers=self.num_workers,
+            multiprocessing_context="forkserver"
+            if self.train_dataset.autoencoder_model is not None
+            else "fork",
             persistent_workers=self.num_workers > 0,
             worker_init_fn=worker_init,
             prefetch_factor=10,
@@ -194,12 +200,13 @@ class BaseDataModule(LightningDataModule):
         return self.get_data_loader(self.test_dataset)
 
 
-@torch.compile()
-def encode(autoencoder_model: torch.nn.Module, data: torch.Tensor) -> Any:
+@torch.compile(fullgraph=True)
+def encode(autoencoder_model: Any, data: torch.Tensor) -> Any:
     data = VaeImageProcessor.normalize(data)
-    return (
-        autoencoder_model.encode(data).latents * autoencoder_model.config.scaling_factor
-    )
+    data = data.unsqueeze(0)  # add batch dimension
+    latents = autoencoder_model.encode(data).latents
+    latents = latents.squeeze(0)  # remove batch dimension
+    return latents * autoencoder_model.config.scaling_factor
 
 
 class TensorDataset(_Dataset[tuple[torch.Tensor, torch.Tensor]]):
@@ -213,7 +220,7 @@ class TensorDataset(_Dataset[tuple[torch.Tensor, torch.Tensor]]):
         self.preprocess = preprocess
         self.autoencoder_model: Any = autoencoder_model
         if self.autoencoder_model is not None:
-            self.autoencoder_model = self.autoencoder_model.eval()
+            self.autoencoder_model = self.autoencoder_model.to("cpu").eval()
 
         self.classes = classes
         self.subset = subset
@@ -233,7 +240,8 @@ class TensorDataset(_Dataset[tuple[torch.Tensor, torch.Tensor]]):
             torch.tensor(preprocessed_image), scale=True
         )
         if self.autoencoder_model is not None:
-            data = encode(self.autoencoder_model, data)
+            with torch.no_grad():
+                data = encode(self.autoencoder_model, data)
         return data, torch.tensor(class_label)
 
 
@@ -438,6 +446,34 @@ class DataModule3(BaseDataModule):
 DataModule: TypeAlias = DataModule1 | DataModule2 | DataModule3
 
 
+def preprocess(
+    preprocess_slice: Any, preprocess_bold_conf: Any, image: npt.NDArray[np.uint8]
+) -> npt.NDArray[np.uint8]:
+    channel_count = image.shape[-3]  # shape is ..., channel_count, height, width
+    if channel_count == 2:  # skull_strip_report and tsnr_rpt
+        data_dict = preprocess_slice(image=image[0, ...], mask=image[1, ...])
+        data_sequence = [data_dict["image"], data_dict["mask"]]
+    elif channel_count == 6:
+        data_dict = preprocess_bold_conf(image=image[0, ...], image0=image[-1, ...])
+        data_sequence = [data_dict["image"], data_dict["image0"]]
+    elif channel_count == 12:
+        weights = np.array(
+            [170, 212, 43, 128, 149, 234, 234, 191, 128, 212, 255],
+            dtype=np.uint8,
+        )
+        keys = ["image", "mask", *(f"mask{i}" for i in range(10))]
+        data_dict = preprocess_slice(**dict(zip(keys, image, strict=True)))
+        data_sequence = [data_dict[key] for key in keys]
+        data = np.stack(data_sequence)
+        merge = (data[1:-1] * weights[:-1, np.newaxis, np.newaxis]).max(axis=0)
+        merge[np.logical_and(merge == 0, data[-1] != 0)] = weights[-1]
+        data_sequence = [data[0], merge]
+    else:
+        raise ValueError
+
+    return np.stack(data_sequence)
+
+
 class TwoChannelDataModule(BaseDataModule):
     channel_count = 2
     class_count = 21 + 21 + 21 + 1 + 21
@@ -474,34 +510,4 @@ class TwoChannelDataModule(BaseDataModule):
     def get_preprocess(self, image_size: int, is_augmentation: bool) -> Any:
         preprocess_slice = SliceDataModule.get_preprocess(image_size, is_augmentation)
         preprocess_bold_conf = DataModule3.get_preprocess(image_size, is_augmentation)
-
-        def preprocess(image: npt.NDArray[np.uint8]) -> npt.NDArray[np.uint8]:
-            channel_count = image.shape[
-                -3
-            ]  # shape is ..., channel_count, height, width
-            if channel_count == 2:  # skull_strip_report and tsnr_rpt
-                data_dict = preprocess_slice(image=image[0, ...], mask=image[1, ...])
-                data_sequence = [data_dict["image"], data_dict["mask"]]
-            elif channel_count == 6:
-                data_dict = preprocess_bold_conf(
-                    image=image[0, ...], image0=image[-1, ...]
-                )
-                data_sequence = [data_dict["image"], data_dict["image0"]]
-            elif channel_count == 12:
-                weights = np.array(
-                    [170, 212, 43, 128, 149, 234, 234, 191, 128, 212, 255],
-                    dtype=np.uint8,
-                )
-                keys = ["image", "mask", *(f"mask{i}" for i in range(10))]
-                data_dict = preprocess_slice(**dict(zip(keys, image, strict=True)))
-                data_sequence = [data_dict[key] for key in keys]
-                data = np.stack(data_sequence)
-                merge = (data[1:-1] * weights[:-1, np.newaxis, np.newaxis]).max(axis=0)
-                merge[np.logical_and(merge == 0, data[-1] != 0)] = weights[-1]
-                data_sequence = [data[0], merge]
-            else:
-                raise ValueError
-
-            return np.stack(data_sequence)
-
-        return preprocess
+        return partial(preprocess, preprocess_slice, preprocess_bold_conf)
